@@ -5,7 +5,7 @@ import type { ControllerConfig, OwnerRoute } from "./config.js";
 import { assertCompatibleOpenClawVersion } from "./config.js";
 import type { GatewayMethodClient } from "./gateway-method-client.js";
 import { errorMessage } from "./gateway-method-client.js";
-import type { ArchiveFailure, ControllerState, StartNotificationFailure, StateStore, WakeFailure } from "./state.js";
+import type { ArchiveFailure, ControllerState, StartNotificationFailure, StateStore, TerminalWakeFailure, TerminalWakeRecord } from "./state.js";
 import { rememberBounded } from "./state.js";
 
 type Logger = {
@@ -16,6 +16,8 @@ type Logger = {
 };
 
 type RuntimeAgent = OpenClawPluginApi["runtime"]["agent"];
+
+type TerminalWakeKind = "completed" | "failed" | "stale" | "blocked" | "startFailure";
 
 type WorkboardNotification = {
   id: string;
@@ -97,6 +99,8 @@ export type ControllerStatus = {
   archiveLastFailures: ControllerState["archiveLastFailures"];
   recentStartNotifications: ControllerState["recentStartNotifications"];
   startNotificationFailures: ControllerState["startNotificationFailures"];
+  recentTerminalWakes: ControllerState["recentTerminalWakes"];
+  terminalWakeFailures: ControllerState["terminalWakeFailures"];
   wakeFailures: ControllerState["wakeFailures"];
   archive: {
     enabled: boolean;
@@ -166,11 +170,13 @@ export class WorkboardController {
       lastDispatchAt: state?.lastDispatchAt,
       lastArchiveScanAt: state?.lastArchiveScanAt,
       lastError: state?.lastError,
-      counters: state?.counters ?? { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
+      counters: state?.counters ?? { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, terminalWakes: 0, terminalWakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
       archiveCandidates: state?.archiveCandidates ?? [],
       archiveLastFailures: state?.archiveLastFailures ?? [],
       recentStartNotifications: state?.recentStartNotifications ?? [],
       startNotificationFailures: state?.startNotificationFailures ?? [],
+      recentTerminalWakes: state?.recentTerminalWakes ?? [],
+      terminalWakeFailures: state?.terminalWakeFailures ?? [],
       wakeFailures: state?.wakeFailures ?? [],
       archive: {
         enabled: this.options.config.archiveEnabled,
@@ -195,6 +201,7 @@ export class WorkboardController {
       await this.ensureSubscription();
       const batch = await this.processNotificationBatch();
       if (batch.newEvents > 0) await this.dispatchReadyCards(reason);
+      if (batch.advanceCount > 0) await this.advanceNotifications(batch.advanceCount);
       const archiveOk = await this.runArchiveScanIfDue();
       if (archiveOk && state.lastError?.startsWith("archive ")) state.lastError = undefined;
       await this.save();
@@ -256,10 +263,12 @@ export class WorkboardController {
       newEvents += 1;
       await this.save();
     }
-    if (advanceCount > 0) {
-      await this.options.gateway.request("workboard.notifications.advance", { subscriptionId, limit: advanceCount });
-    }
     return { advanceCount, newEvents };
+  }
+
+  private async advanceNotifications(advanceCount: number): Promise<void> {
+    const subscriptionId = await this.ensureSubscription();
+    await this.options.gateway.request("workboard.notifications.advance", { subscriptionId, limit: advanceCount });
   }
 
 
@@ -333,14 +342,14 @@ export class WorkboardController {
   }
 
   private async handleNotification(event: WorkboardNotification): Promise<void> {
-    if (event.kind === "completed") return;
-    await this.wakeOwner({
-      problemKey: `${event.kind}:${event.id}`,
+    await this.wakeTerminalOwner({
+      wakeKey: terminalWakeKeyForEvent(event),
       kind: event.kind,
       message: event.message,
       cardId: event.cardId,
       sessionKey: event.sessionKey,
       runId: event.runId,
+      event,
     });
   }
 
@@ -358,17 +367,17 @@ export class WorkboardController {
     await this.save();
     await this.notifyStartedCards(result.started ?? [], reason, now);
     for (const card of result.blocked ?? []) {
-      await this.wakeOwner({
-        problemKey: `blocked:${card.id}:${card.updatedAt ?? card.status ?? "unknown"}`,
+      await this.wakeTerminalOwner({
+        wakeKey: `blocked:${card.id}:${card.updatedAt ?? card.status ?? "unknown"}`,
         kind: "blocked",
         message: `Workboard card blocked during dispatch (${reason}): ${card.title ?? card.id}`,
         card,
       });
     }
     for (const failure of result.startFailures ?? []) {
-      await this.wakeOwner({
-        problemKey: `start-failure:${failure.cardId ?? failure.card?.id ?? randomUUID()}:${failure.error ?? "unknown"}`,
-        kind: "failed",
+      await this.wakeTerminalOwner({
+        wakeKey: startFailureWakeKey(failure),
+        kind: "startFailure",
         message: `Workboard worker start failed: ${failure.error ?? "unknown error"}`,
         cardId: failure.cardId ?? failure.card?.id,
         card: failure.card,
@@ -470,39 +479,41 @@ export class WorkboardController {
     this.options.logger?.warn?.("workboard-controller start notification failed", failure);
   }
 
-  private async wakeOwner(input: {
-    problemKey: string;
-    kind: "failed" | "stale" | "blocked";
+  private async wakeTerminalOwner(input: {
+    wakeKey: string;
+    kind: TerminalWakeKind;
     message: string;
     cardId?: string;
     sessionKey?: string;
     runId?: string;
     card?: WorkboardCard;
+    event?: WorkboardNotification;
   }): Promise<void> {
     const state = await this.requireState();
-    if (!this.options.config.wakeEnabled) return;
-    if (state.notifiedProblemIds.includes(input.problemKey)) return;
+    if (!this.options.config.terminalWakeEnabled) return;
+    if (state.terminalWakeIds.includes(input.wakeKey)) return;
 
     const contextResult = await this.resolveProblemCardContext(input);
     const card = contextResult.card;
     const cardId = input.cardId ?? card?.id;
-    const target = this.resolveProblemWakeTarget(input, card);
+    const title = terminalWakeTitle(input, card);
+    const target = this.resolveTerminalWakeTarget(input, card);
     if (target.status !== "target") {
       const error = target.status === "rejected"
         ? target.error
         : contextResult.lookupError
           ? `could not resolve owner route after workboard.cards.list failed: ${contextResult.lookupError}`
-          : "could not resolve a reliable owner route; configure ownerRoutes or wakeFallbackSessionKey";
-      await this.recordWakeFailure({ problemKey: input.problemKey, kind: input.kind, cardId, target: target.status === "rejected" ? target.target : undefined, error, at: Date.now() });
+          : "could not resolve a reliable owner route; configure ownerRoutes with the original owner sessionKey";
+      await this.recordTerminalWakeFailure({ wakeKey: input.wakeKey, kind: input.kind, cardId, target: target.status === "rejected" ? target.target : undefined, error, at: Date.now() });
       return;
     }
 
     const workspaceDir = this.options.runtimeAgent.resolveAgentWorkspaceDir(this.options.fullConfig, target.agentId);
     const timeoutMs = this.options.config.wakeTimeoutMs || this.options.runtimeAgent.resolveAgentTimeoutMs({ cfg: this.options.fullConfig });
-    const prompt = buildWakePrompt({ ...input, card });
+    const prompt = buildTerminalWakePrompt({ ...input, card });
     try {
       await this.options.runtimeAgent.runEmbeddedAgent({
-        // sessionId is a transcript identifier, not a routing sessionKey.
+        // sessionId is a transcript identifier, not the owner routing sessionKey.
         sessionId: randomUUID(),
         sessionKey: target.sessionKey,
         agentId: target.agentId,
@@ -514,16 +525,20 @@ export class WorkboardController {
         timeoutMs,
         ...(this.options.config.wakeToolsAllow ? { toolsAllow: this.options.config.wakeToolsAllow } : {}),
       });
-      state.notifiedProblemIds = rememberBounded(state.notifiedProblemIds, input.problemKey);
+      const record: TerminalWakeRecord = { wakeKey: input.wakeKey, kind: input.kind, cardId, title, target: target.sessionKey, wokenAt: Date.now() };
+      state.terminalWakeIds = rememberBounded(state.terminalWakeIds, input.wakeKey);
+      if (input.kind !== "completed") state.notifiedProblemIds = rememberBounded(state.notifiedProblemIds, input.wakeKey);
+      state.recentTerminalWakes = [...state.recentTerminalWakes, record].slice(-50);
+      state.counters.terminalWakes += 1;
       state.counters.wakes += 1;
-      if (state.lastError?.startsWith("problem wake failed")) state.lastError = undefined;
+      if (state.lastError?.startsWith("terminal wake failed") || state.lastError?.startsWith("problem wake failed")) state.lastError = undefined;
       await this.save();
     } catch (error) {
-      await this.recordWakeFailure({ problemKey: input.problemKey, kind: input.kind, cardId, target: target.sessionKey, error: errorMessage(error), at: Date.now() });
+      await this.recordTerminalWakeFailure({ wakeKey: input.wakeKey, kind: input.kind, cardId, target: target.sessionKey, error: errorMessage(error), at: Date.now() });
     }
   }
 
-  private resolveProblemWakeTarget(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard }, card?: WorkboardCard): OwnerTargetResolution {
+  private resolveTerminalWakeTarget(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard }, card?: WorkboardCard): OwnerTargetResolution {
     const cardId = input.cardId ?? card?.id ?? input.card?.id;
     const context = this.ownerRouteContext({ card: card ?? input.card });
     const eventSessionKey = optionalSessionKey(input.sessionKey);
@@ -531,19 +546,21 @@ export class WorkboardController {
       card: card ?? input.card,
       extra: eventSessionKey && isWorkboardWorkerSessionKey(eventSessionKey, cardId) ? [eventSessionKey] : [],
     });
-    const routeTarget = this.resolveConfiguredOwnerRoute(context, workerKeys, cardId);
-    if (routeTarget.status !== "none") return routeTarget;
-
-    const fallback = optionalSessionKey(this.options.config.wakeFallbackSessionKey);
-    if (fallback) {
-      if (isReliableExternalOwnerSessionKey(fallback, workerKeys, cardId)) {
-        return { status: "target", sessionKey: fallback, agentId: this.targetAgentId(fallback, context), source: "legacy-wakeFallbackSessionKey" };
-      }
-      return { status: "rejected", target: fallback, error: `legacy wakeFallbackSessionKey target rejected as a worker session: ${fallback}` };
-    }
-    return { status: "none" };
+    return this.resolveConfiguredOwnerRoute(context, workerKeys, cardId);
   }
 
+  private async recordTerminalWakeFailure(failure: TerminalWakeFailure): Promise<void> {
+    const state = await this.requireState();
+    state.terminalWakeFailures = [...state.terminalWakeFailures, failure].slice(-50);
+    state.wakeFailures = [...state.wakeFailures, { problemKey: failure.wakeKey, kind: failure.kind, cardId: failure.cardId, target: failure.target, error: failure.error, at: failure.at }].slice(-50);
+    state.terminalWakeIds = rememberBounded(state.terminalWakeIds, failure.wakeKey);
+    if (failure.kind !== "completed") state.notifiedProblemIds = rememberBounded(state.notifiedProblemIds, failure.wakeKey);
+    state.lastError = `terminal wake failed${failure.cardId ? ` for ${failure.cardId}` : ""}: ${failure.error}`;
+    state.counters.terminalWakeErrors += 1;
+    state.counters.wakeErrors += 1;
+    await this.save();
+    this.options.logger?.warn?.("workboard-controller terminal wake failed", failure);
+  }
   private resolveConfiguredOwnerRoute(context: OwnerRouteContext, workerKeys: string[], cardId?: string): OwnerTargetResolution {
     const route = selectOwnerRoute(this.options.config.ownerRoutes, context);
     if (!route) return { status: "none" };
@@ -586,15 +603,7 @@ export class WorkboardController {
     }
   }
 
-  private async recordWakeFailure(failure: WakeFailure): Promise<void> {
-    const state = await this.requireState();
-    state.wakeFailures = [...state.wakeFailures, failure].slice(-50);
-    state.notifiedProblemIds = rememberBounded(state.notifiedProblemIds, failure.problemKey);
-    state.lastError = `problem wake failed${failure.cardId ? ` for ${failure.cardId}` : ""}: ${failure.error}`;
-    state.counters.wakeErrors += 1;
-    await this.save();
-    this.options.logger?.warn?.("workboard-controller problem wake failed", failure);
-  }
+
 }
 
 
@@ -717,18 +726,81 @@ function buildStartNotificationPrompt(input: { cardId: string; title: string; re
   ].join("\n");
 }
 
-function buildWakePrompt(input: { kind: string; message: string; runId?: string; card?: WorkboardCard }): string {
+function terminalWakeKeyForEvent(event: WorkboardNotification): string {
+  return `event:${event.id}`;
+}
+
+function startFailureWakeKey(failure: NonNullable<DispatchPayload["startFailures"]>[number]): string {
+  const cardId = optionalSessionKey(failure.cardId) ?? optionalSessionKey(failure.card?.id) ?? "unknown-card";
+  const error = compactIdentityPart(failure.error ?? "unknown");
+  return `start-failure:${cardId}:${error}`;
+}
+
+function compactIdentityPart(value: string): string {
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, "-").replace(/^-+|-+$/g, "");
+  return normalized.slice(0, 96) || "unknown";
+}
+
+function terminalWakeTitle(input: { cardId?: string; card?: WorkboardCard; event?: WorkboardNotification }, card?: WorkboardCard): string | undefined {
+  return optionalSessionKey(card?.title) ?? optionalSessionKey(input.card?.title) ?? optionalSessionKey(input.cardId) ?? optionalSessionKey(card?.id) ?? optionalSessionKey(input.event?.cardId);
+}
+
+function buildTerminalWakePrompt(input: { wakeKey: string; kind: TerminalWakeKind; message: string; runId?: string; card?: WorkboardCard; event?: WorkboardNotification }): string {
+  const card = input.card;
+  const cardId = optionalSessionKey(card?.id) ?? optionalSessionKey(input.event?.cardId) ?? "unknown";
+  const title = optionalSessionKey(card?.title) ?? "unknown";
   const lines = [
-    "OpenClaw Workboard controller noticed a problem event.",
-    "Notify the owner concisely through the normal session route. Do not clear Goals. Do not create a second workflow ledger.",
-    `kind: ${input.kind}`,
-    `message: ${input.message}`,
+    "OpenClaw Workboard controller is waking the original owner session for a terminal Workboard event.",
+    "This is an owner-agent processing turn. Use the public Workboard notification/card data below as context.",
+    `eventKind: ${input.kind}`,
+    `wakeKey: ${input.wakeKey}`,
+    `cardId: ${cardId}`,
+    `cardTitle: ${title}`,
+    `summary: ${input.message || "none"}`,
   ];
+  if (input.event?.id) lines.push(`eventId: ${input.event.id}`);
+  if (input.event?.createdAt !== undefined) lines.push(`eventCreatedAt: ${input.event.createdAt}`);
   if (input.runId) lines.push(`runId: ${input.runId}`);
-  if (input.card) {
-    lines.push(`cardId: ${input.card.id}`);
-    if (input.card.title) lines.push(`cardTitle: ${input.card.title}`);
-    if (input.card.status) lines.push(`cardStatus: ${input.card.status}`);
+  if (card?.status) lines.push(`cardStatus: ${card.status}`);
+  if (card?.boardId) lines.push(`boardId: ${card.boardId}`);
+  if (card?.agentId) lines.push(`agentId: ${card.agentId}`);
+  const tenant = tenantFromCard(card);
+  if (tenant) lines.push(`tenant: ${tenant}`);
+  lines.push(...publicResultPointers(card));
+  if (input.kind === "completed") {
+    lines.push(
+      "Instruction: Review the terminal result, update the user only if useful, and handle any necessary follow-up.",
+      "Do not duplicate Workboard dispatch and do not redo completed work. The controller may auto-dispatch next ready cards separately.",
+    );
+  } else {
+    lines.push(
+      "Instruction: Inspect the card/run, explain or repair/retry when safe, use Workboard recovery actions as appropriate, and notify the user when action or a decision is needed.",
+      "Do not blindly retry infinitely, bypass maxRetries, or route work into a worker session.",
+    );
   }
   return lines.join("\n");
+}
+
+function publicResultPointers(card?: WorkboardCard): string[] {
+  if (!card) return ["publicPointers: none available in public notification/card data"];
+  const lines: string[] = [];
+  if (card.completedAt !== undefined) lines.push(`completedAt: ${card.completedAt}`);
+  if (card.updatedAt !== undefined) lines.push(`updatedAt: ${card.updatedAt}`);
+  const metadata = asRecord(card.metadata);
+  const pointerKeys = ["summary", "completion", "result", "results", "proof", "proofs", "artifact", "artifacts", "deliverable", "deliverables", "links"];
+  for (const key of pointerKeys) {
+    const value = metadata[key];
+    if (value !== undefined) lines.push(`public.${key}: ${compactJson(value)}`);
+  }
+  return lines.length ? lines : ["publicPointers: none available in public notification/card data"];
+}
+
+function compactJson(value: unknown): string {
+  try {
+    const text = JSON.stringify(value);
+    if (!text) return String(value);
+    return text.length > 900 ? `${text.slice(0, 897)}...` : text;
+  } catch {
+    return String(value);
+  }
 }

@@ -1,8 +1,8 @@
 {
   "id": "workboard-controller",
   "name": "Workboard Controller",
-  "description": "Automatically dispatches Workboard ready cards after terminal events, notifies owners when cards start, and wakes owners on problem events.",
-  "version": "0.3.0",
+  "description": "Automatically dispatches Workboard ready cards after terminal events, wakes owner sessions for terminal results, and notifies owners when cards start.",
+  "version": "0.4.0",
   "activation": {
     "onStartup": true,
     "onConfigPaths": [
@@ -107,13 +107,17 @@
         "type": "string",
         "description": "Legacy global start-notification fallback used only when ownerRoutes has no match."
       },
+      "terminalWakeEnabled": {
+        "type": "boolean",
+        "description": "Run an owner-session embedded-agent wake for terminal Workboard events: completed, failed, stale, dispatch blocked, and worker start failures. Default true; when absent, legacy wakeEnabled is honored."
+      },
       "wakeEnabled": {
         "type": "boolean",
-        "description": "Wake owner sessions on failed/stale/blocked events. Default true."
+        "description": "Legacy alias for terminalWakeEnabled. Used only when terminalWakeEnabled is absent."
       },
       "wakeFallbackSessionKey": {
         "type": "string",
-        "description": "Legacy global problem-wake fallback used only when ownerRoutes has no match."
+        "description": "Legacy global fallback retained for start notification compatibility only. Terminal owner wakes require ownerRoutes."
       },
       "wakeFallbackAgentId": {
         "type": "string",
@@ -121,14 +125,14 @@
       },
       "wakeTimeoutMs": {
         "type": "number",
-        "description": "Problem wake embedded-agent timeout in milliseconds. Default 120000."
+        "description": "Terminal wake/start notification embedded-agent timeout in milliseconds. Default 120000."
       },
       "wakeToolsAllow": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "Optional tool allowlist for problem wake runs."
+        "description": "Optional tool allowlist for terminal wake runs."
       },
       "compatibleOpenClawVersions": {
         "type": "array",

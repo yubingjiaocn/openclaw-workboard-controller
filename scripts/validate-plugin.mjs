@@ -75,6 +75,7 @@ for (const key of [
   "ownerRoutes",
   "startNotifyEnabled",
   "startNotifySessionKey",
+  "terminalWakeEnabled",
   "wakeEnabled",
   "wakeFallbackAgentId",
   "archiveEnabled",

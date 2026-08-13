@@ -2,7 +2,7 @@ import { Type } from "typebox";
 
 export const PLUGIN_ID = "workboard-controller";
 export const PLUGIN_NAME = "Workboard Controller";
-export const PLUGIN_DESCRIPTION = "Automatically dispatches Workboard ready cards after terminal events, notifies owners when cards start, and wakes owners on problem events.";
+export const PLUGIN_DESCRIPTION = "Automatically dispatches Workboard ready cards after terminal events, wakes owner sessions for terminal results, and notifies owners when cards start.";
 export const SUPPORTED_OPENCLAW_VERSION = "2026.7.1-2";
 
 const DEFAULT_POLL_INTERVAL_MS = 15_000;
@@ -39,11 +39,12 @@ export const configSchema = Type.Object(
     ownerRoutes: Type.Optional(Type.Array(ownerRouteSchema, { description: "Channel-agnostic owner routing table. Each entry must include sessionKey and at least one of tenant, boardId, or agentId. Match priority is tenant+boardId+agentId, then boardId+agentId, then tenant+boardId or tenant+agentId, then single dimensions; equal priority uses declaration order." })),
     startNotifyEnabled: Type.Optional(Type.Boolean({ description: "Notify the owner/routing session when dispatch starts Workboard cards. Default true." })),
     startNotifySessionKey: Type.Optional(Type.String({ description: "Legacy global start-notification fallback used only when ownerRoutes has no match." })),
-    wakeEnabled: Type.Optional(Type.Boolean({ description: "Wake owner sessions on failed/stale/blocked events. Default true." })),
-    wakeFallbackSessionKey: Type.Optional(Type.String({ description: "Legacy global problem-wake fallback used only when ownerRoutes has no match." })),
+    terminalWakeEnabled: Type.Optional(Type.Boolean({ description: "Run an owner-session embedded-agent wake for terminal Workboard events: completed, failed, stale, dispatch blocked, and worker start failures. Default true; when absent, legacy wakeEnabled is honored." })),
+    wakeEnabled: Type.Optional(Type.Boolean({ description: "Legacy alias for terminalWakeEnabled. Used only when terminalWakeEnabled is absent." })),
+    wakeFallbackSessionKey: Type.Optional(Type.String({ description: "Legacy global fallback retained for start notification compatibility only. Terminal owner wakes require ownerRoutes." })),
     wakeFallbackAgentId: Type.Optional(Type.String({ description: "Fallback agent id when an event/card has no agent. Default main." })),
-    wakeTimeoutMs: Type.Optional(Type.Number({ description: "Problem wake embedded-agent timeout in milliseconds. Default 120000." })),
-    wakeToolsAllow: Type.Optional(Type.Array(Type.String(), { description: "Optional tool allowlist for problem wake runs." })),
+    wakeTimeoutMs: Type.Optional(Type.Number({ description: "Terminal wake/start notification embedded-agent timeout in milliseconds. Default 120000." })),
+    wakeToolsAllow: Type.Optional(Type.Array(Type.String(), { description: "Optional tool allowlist for terminal wake runs." })),
     archiveEnabled: Type.Optional(Type.Boolean({ description: "Archive eligible done Workboard cards. Default false." })),
     archiveDryRun: Type.Optional(Type.Boolean({ description: "Report archive candidates without mutating cards. Default true." })),
     archiveCompletedGraphAfterMs: Type.Optional(Type.Number({ description: "Cooling period for all-done linked components before archive. Default 86400000." })),
@@ -77,6 +78,7 @@ export type ControllerConfig = {
   ownerRoutes: OwnerRoute[];
   startNotifyEnabled: boolean;
   startNotifySessionKey?: string;
+  terminalWakeEnabled: boolean;
   wakeEnabled: boolean;
   wakeFallbackSessionKey?: string;
   wakeFallbackAgentId: string;
@@ -156,6 +158,7 @@ export function normalizeControllerConfig(raw: unknown): ControllerConfig {
     ownerRoutes: normalizeOwnerRoutes(record),
     startNotifyEnabled: optionalBoolean(record, "startNotifyEnabled", true),
     startNotifySessionKey: optionalString(record, "startNotifySessionKey"),
+    terminalWakeEnabled: optionalBoolean(record, "terminalWakeEnabled", optionalBoolean(record, "wakeEnabled", true)),
     wakeEnabled: optionalBoolean(record, "wakeEnabled", true),
     wakeFallbackSessionKey: optionalString(record, "wakeFallbackSessionKey"),
     wakeFallbackAgentId: optionalString(record, "wakeFallbackAgentId") ?? "main",

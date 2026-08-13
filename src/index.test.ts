@@ -353,7 +353,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifyEnabled: false }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifyEnabled: false, terminalWakeEnabled: false }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -376,12 +376,184 @@ describe("WorkboardController", () => {
     expect(calls.map((call) => call.method)).toEqual([
       "workboard.notifications.subscribe",
       "workboard.notifications.events",
-      "workboard.notifications.advance",
       "workboard.cards.dispatch",
+      "workboard.notifications.advance",
     ]);
     expect(store.state.processedEventIds).toEqual(["evt-1"]);
     expect(store.state.counters.dispatches).toBe(1);
     expect(wakeRuns).toHaveLength(0);
+  });
+
+
+  it("wakes the owner session for completed notifications with result context and still dispatches", async () => {
+    const store = new MemoryStateStore();
+    const methods: string[] = [];
+    const dispatchCalls = { count: 0 };
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-complete",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [{ boardId: "board-complete", agentId: "may", sessionKey: "agent:may:feishu:direct:ou_complete" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        methods,
+        dispatchCalls,
+        eventBatches: [[{ id: "evt-completed-owner", kind: "completed", createdAt: 7, message: "completed with proof", cardId: "card-completed-owner", sessionKey: "agent:may:workboard-card-completed-owner", runId: "run-completed-owner" }]],
+        cards: [{
+          id: "card-completed-owner",
+          boardId: "board-complete",
+          agentId: "may",
+          title: "Completed Owner Wake",
+          status: "done",
+          completedAt: 10,
+          sessionKey: "agent:may:workboard-card-completed-owner",
+          execution: { runId: "run-completed-owner", sessionKey: "agent:may:workboard-card-completed-owner" },
+          metadata: { tenant: "tenant-complete", proof: [{ status: "passed", note: "unit proof" }], artifacts: [{ path: "dist/report.txt" }] },
+        }],
+      }),
+    });
+
+    const status = await controller.runOnce("completed-owner");
+
+    expect(methods).toEqual([
+      "workboard.notifications.subscribe",
+      "workboard.notifications.events",
+      "workboard.cards.list",
+      "workboard.cards.dispatch",
+      "workboard.notifications.advance",
+    ]);
+    expect(dispatchCalls.count).toBe(1);
+    expect(wakeRuns).toHaveLength(1);
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:may:feishu:direct:ou_complete", agentId: "may", trigger: "manual" });
+    expect(wakeRuns[0]).not.toMatchObject({ sessionKey: "agent:may:workboard-card-completed-owner" });
+    const prompt = String(wakeRuns[0].prompt);
+    expect(prompt).toContain("cardId: card-completed-owner");
+    expect(prompt).toContain("cardTitle: Completed Owner Wake");
+    expect(prompt).toContain("summary: completed with proof");
+    expect(prompt).toContain("public.proof");
+    expect(prompt).toContain("dist/report.txt");
+    expect(prompt).toContain("Review the terminal result");
+    expect(prompt).toContain("Do not duplicate Workboard dispatch");
+    expect(status.counters.terminalWakes).toBe(1);
+    expect(status.counters.terminalWakeErrors).toBe(0);
+    expect(status.counters.dispatches).toBe(1);
+    expect(status.recentTerminalWakes).toMatchObject([{ wakeKey: "event:evt-completed-owner", kind: "completed", cardId: "card-completed-owner", target: "agent:may:feishu:direct:ou_complete" }]);
+  });
+
+  it("deduplicates completed terminal wakes and dispatch after restart", async () => {
+    const store = new MemoryStateStore();
+    const dispatchCalls = { count: 0 };
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const config = normalizeControllerConfig({
+      boardId: "board-repeat",
+      dispatchCooldownMs: 0,
+      ownerRoutes: [{ boardId: "board-repeat", sessionKey: "agent:main:telegram:direct:repeat-owner" }],
+    });
+
+    const first = new WorkboardController({
+      config,
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        dispatchCalls,
+        eventBatches: [[{ id: "evt-completed-repeat", kind: "completed", createdAt: 1, message: "done" }]],
+      }),
+    });
+    await first.runOnce("before-restart");
+
+    const second = new WorkboardController({
+      config,
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        dispatchCalls,
+        eventBatches: [[{ id: "evt-completed-repeat", kind: "completed", createdAt: 1, message: "done" }]],
+      }),
+    });
+    const status = await second.runOnce("after-restart");
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(dispatchCalls.count).toBe(1);
+    expect(status.counters.terminalWakes).toBe(1);
+    expect(store.state.terminalWakeIds).toEqual(["event:evt-completed-repeat"]);
+    expect(store.state.processedEventIds).toEqual(["evt-completed-repeat"]);
+  });
+
+  it("continues dispatch and cursor advance when completed owner wake delivery fails", async () => {
+    const store = new MemoryStateStore();
+    const methods: string[] = [];
+    const dispatchCalls = { count: 0 };
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent({ fail: true });
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-wake-fail",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [{ boardId: "board-wake-fail", sessionKey: "agent:main:telegram:direct:wake-fail-owner" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        methods,
+        dispatchCalls,
+        eventBatches: [[{ id: "evt-completed-wake-fail", kind: "completed", createdAt: 1, message: "done" }]],
+      }),
+    });
+
+    const status = await controller.runOnce("wake-failure");
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(dispatchCalls.count).toBe(1);
+    expect(methods).toEqual([
+      "workboard.notifications.subscribe",
+      "workboard.notifications.events",
+      "workboard.cards.dispatch",
+      "workboard.notifications.advance",
+    ]);
+    expect(status.counters.dispatches).toBe(1);
+    expect(status.counters.terminalWakeErrors).toBe(1);
+    expect(status.terminalWakeFailures).toMatchObject([{ wakeKey: "event:evt-completed-wake-fail", kind: "completed", target: "agent:main:telegram:direct:wake-fail-owner", error: "embedded delivery failed" }]);
+    expect(store.state.processedEventIds).toEqual(["evt-completed-wake-fail"]);
+  });
+
+  it("rejects worker ownerRoutes targets for completed terminal wakes without blocking dispatch", async () => {
+    const store = new MemoryStateStore();
+    const dispatchCalls = { count: 0 };
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-completed-worker",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [{ boardId: "board-completed-worker", agentId: "main", sessionKey: "agent:main:workboard-card-completed-worker" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        dispatchCalls,
+        eventBatches: [[{ id: "evt-completed-worker", kind: "completed", createdAt: 1, message: "done", cardId: "card-completed-worker", sessionKey: "agent:main:workboard-card-completed-worker" }]],
+        cards: [{ id: "card-completed-worker", boardId: "board-completed-worker", agentId: "main", title: "Completed Worker", sessionKey: "agent:main:workboard-card-completed-worker" }],
+      }),
+    });
+
+    const status = await controller.runOnce("completed-worker-target");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(dispatchCalls.count).toBe(1);
+    expect(status.counters.terminalWakeErrors).toBe(1);
+    expect(status.terminalWakeFailures[0]).toMatchObject({ wakeKey: "event:evt-completed-worker", kind: "completed", target: "agent:main:workboard-card-completed-worker" });
+    expect(status.terminalWakeFailures[0]?.error).toMatch(/ownerRoutes target rejected as a worker session/);
   });
 
   it("wakes once for repeated failed notification ids", async () => {
@@ -389,7 +561,7 @@ describe("WorkboardController", () => {
     const calls: string[] = [];
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, wakeFallbackSessionKey: "agent:main:telegram:direct:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:owner" }] }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -415,7 +587,7 @@ describe("WorkboardController", () => {
     expect(wakeRuns[0].sessionId).toMatch(/^[0-9a-f-]{36}$/);
     expect(calls.filter((method) => method === "workboard.cards.dispatch")).toHaveLength(1);
     expect(calls.filter((method) => method === "workboard.notifications.advance")).toHaveLength(2);
-    expect(store.state.notifiedProblemIds).toEqual(["failed:evt-failed"]);
+    expect(store.state.notifiedProblemIds).toEqual(["event:evt-failed"]);
     expect(store.state.processedEventIds).toEqual(["evt-failed"]);
   });
 
@@ -563,7 +735,7 @@ describe("WorkboardController", () => {
       const methods: string[] = [];
       const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
       const controller = new WorkboardController({
-        config: normalizeControllerConfig({ dispatchCooldownMs: 0, ...input.config }),
+        config: normalizeControllerConfig({ dispatchCooldownMs: 0, terminalWakeEnabled: false, ...input.config }),
         runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
         fullConfig: {},
         stateStore: store,
@@ -781,7 +953,10 @@ describe("WorkboardController", () => {
       "agent:main:telegram:direct:8068735520",
       "agent:main:telegram:direct:8068735520",
     ]);
+    expect(String(wakeRuns[0].prompt)).toContain("Inspect the card/run");
+    expect(String(wakeRuns[0].prompt)).toContain("maxRetries");
     expect(status.counters.wakes).toBe(4);
+    expect(status.counters.terminalWakes).toBe(4);
     expect(status.counters.wakeErrors).toBe(0);
   });
 
@@ -841,7 +1016,7 @@ describe("WorkboardController", () => {
     expect(status.wakeFailures[0]?.error).toMatch(/ownerRoutes target rejected as a worker session/);
   });
 
-  it("rejects wakeFallbackSessionKey problem wake targets that are worker session keys", async () => {
+  it("does not use legacy wakeFallbackSessionKey as a terminal wake target", async () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
@@ -864,8 +1039,8 @@ describe("WorkboardController", () => {
 
     expect(wakeRuns).toHaveLength(0);
     expect(status.counters.wakeErrors).toBe(1);
-    expect(status.wakeFailures[0]).toMatchObject({ target: "agent:main:workboard-card-fallback-worker" });
-    expect(status.wakeFailures[0]?.error).toMatch(/wakeFallbackSessionKey target rejected as a worker session/);
+    expect(status.wakeFailures[0]).toMatchObject({ target: undefined });
+    expect(status.wakeFailures[0]?.error).toMatch(/configure ownerRoutes/);
   });
 
   it("records visible failure when no reliable external start notification target exists", async () => {
@@ -984,8 +1159,8 @@ describe("WorkboardController", () => {
 
     expect(wakeRuns).toHaveLength(0);
     expect(status.counters.wakeErrors).toBe(1);
-    expect(status.lastError).toMatch(/problem wake failed/);
-    expect(status.wakeFailures).toMatchObject([{ problemKey: "failed:evt-no-route", kind: "failed", cardId: "card-no-route" }]);
+    expect(status.lastError).toMatch(/terminal wake failed/);
+    expect(status.wakeFailures).toMatchObject([{ problemKey: "event:evt-no-route", kind: "failed", cardId: "card-no-route" }]);
   });
 
   it("records no-route wake failure for startFailure without card context", async () => {
@@ -998,6 +1173,8 @@ describe("WorkboardController", () => {
       stateStore: store,
       runtimeAgent,
       gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-completed-context", kind: "completed", createdAt: 1, message: "done", cardId: "card-completed-context" }]],
+        cards: [{ id: "card-completed-context", boardId: "default", agentId: "may", title: "Completed Context" }],
         startFailures: [{ error: "no worker" }],
       }),
     });
@@ -1005,9 +1182,9 @@ describe("WorkboardController", () => {
     const status = await controller.runOnce("start-failure-no-context");
 
     expect(wakeRuns).toHaveLength(0);
-    expect(status.counters.wakeErrors).toBe(1);
-    expect(status.wakeFailures[0]).toMatchObject({ kind: "failed", error: expect.stringMatching(/could not resolve a reliable owner route/) });
-    expect(status.wakeFailures[0]?.problemKey).toMatch(/^start-failure:/);
+    expect(status.counters.wakeErrors).toBe(2);
+    expect(status.wakeFailures.at(-1)).toMatchObject({ kind: "startFailure", error: expect.stringMatching(/could not resolve a reliable owner route/) });
+    expect(status.wakeFailures.at(-1)?.problemKey).toMatch(/^start-failure:/);
   });
 
 });

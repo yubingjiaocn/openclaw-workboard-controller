@@ -32,6 +32,24 @@ export type StartNotificationFailure = {
   at: number;
 };
 
+export type TerminalWakeRecord = {
+  wakeKey: string;
+  kind: string;
+  cardId?: string;
+  title?: string;
+  target: string;
+  wokenAt: number;
+};
+
+export type TerminalWakeFailure = {
+  wakeKey: string;
+  kind: string;
+  cardId?: string;
+  target?: string;
+  error: string;
+  at: number;
+};
+
 export type WakeFailure = {
   problemKey: string;
   kind: string;
@@ -45,6 +63,7 @@ export type ControllerState = {
   version: 1;
   subscriptionId?: string;
   processedEventIds: string[];
+  terminalWakeIds: string[];
   notifiedProblemIds: string[];
   notifiedStartIds: string[];
   lastDispatchAt?: number;
@@ -55,6 +74,8 @@ export type ControllerState = {
   archiveLastFailures: ArchiveFailure[];
   recentStartNotifications: StartNotificationRecord[];
   startNotificationFailures: StartNotificationFailure[];
+  recentTerminalWakes: TerminalWakeRecord[];
+  terminalWakeFailures: TerminalWakeFailure[];
   wakeFailures: WakeFailure[];
   counters: {
     ticks: number;
@@ -62,6 +83,8 @@ export type ControllerState = {
     dispatches: number;
     wakes: number;
     wakeErrors: number;
+    terminalWakes: number;
+    terminalWakeErrors: number;
     errors: number;
     archiveScans: number;
     archiveCandidates: number;
@@ -83,13 +106,16 @@ export function emptyState(): ControllerState {
     version: 1,
     processedEventIds: [],
     notifiedProblemIds: [],
+    terminalWakeIds: [],
     notifiedStartIds: [],
     archiveCandidates: [],
     archiveLastFailures: [],
     recentStartNotifications: [],
     startNotificationFailures: [],
+    recentTerminalWakes: [],
+    terminalWakeFailures: [],
     wakeFailures: [],
-    counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
+    counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, terminalWakes: 0, terminalWakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
   };
 }
 
@@ -154,6 +180,42 @@ function normalizeStartNotificationFailures(value: unknown): StartNotificationFa
   }).slice(-50);
 }
 
+function normalizeTerminalWakes(value: unknown): TerminalWakeRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry): TerminalWakeRecord[] => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const wakeKey = typeof record.wakeKey === "string" ? record.wakeKey : undefined;
+    const kind = typeof record.kind === "string" ? record.kind : undefined;
+    const cardId = typeof record.cardId === "string" ? record.cardId : undefined;
+    const title = typeof record.title === "string" ? record.title : undefined;
+    const target = typeof record.target === "string" ? record.target : undefined;
+    const wokenAt = typeof record.wokenAt === "number" && Number.isFinite(record.wokenAt) ? record.wokenAt : undefined;
+    if (!wakeKey || !kind || !target || wokenAt === undefined) return [];
+    return [{ wakeKey, kind, cardId, title, target, wokenAt }];
+  }).slice(-50);
+}
+
+function normalizeTerminalWakeFailures(value: unknown): TerminalWakeFailure[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry): TerminalWakeFailure[] => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const wakeKey = typeof record.wakeKey === "string"
+      ? record.wakeKey
+      : typeof record.problemKey === "string"
+        ? record.problemKey
+        : undefined;
+    const kind = typeof record.kind === "string" ? record.kind : undefined;
+    const cardId = typeof record.cardId === "string" ? record.cardId : undefined;
+    const target = typeof record.target === "string" ? record.target : undefined;
+    const error = typeof record.error === "string" ? record.error : undefined;
+    const at = typeof record.at === "number" && Number.isFinite(record.at) ? record.at : undefined;
+    if (!wakeKey || !kind || !error || at === undefined) return [];
+    return [{ wakeKey, kind, cardId, target, error, at }];
+  }).slice(-50);
+}
+
 function normalizeWakeFailures(value: unknown): WakeFailure[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry): WakeFailure[] => {
@@ -177,11 +239,17 @@ function normalizeState(raw: unknown): ControllerState {
   const counters = record.counters && typeof record.counters === "object" && !Array.isArray(record.counters)
     ? (record.counters as Record<string, unknown>)
     : {};
+  const legacyProblemIds = Array.isArray(record.notifiedProblemIds) ? record.notifiedProblemIds.filter((v): v is string => typeof v === "string").slice(-1000) : [];
+  const terminalWakeIds = Array.isArray(record.terminalWakeIds)
+    ? record.terminalWakeIds.filter((v): v is string => typeof v === "string").slice(-1000)
+    : legacyProblemIds;
+  const wakeFailures = normalizeWakeFailures(record.wakeFailures);
   return {
     version: 1,
     subscriptionId: typeof record.subscriptionId === "string" ? record.subscriptionId : undefined,
     processedEventIds: Array.isArray(record.processedEventIds) ? record.processedEventIds.filter((v): v is string => typeof v === "string").slice(-1000) : [],
-    notifiedProblemIds: Array.isArray(record.notifiedProblemIds) ? record.notifiedProblemIds.filter((v): v is string => typeof v === "string").slice(-1000) : [],
+    terminalWakeIds,
+    notifiedProblemIds: legacyProblemIds,
     notifiedStartIds: Array.isArray(record.notifiedStartIds) ? record.notifiedStartIds.filter((v): v is string => typeof v === "string").slice(-1000) : [],
     lastDispatchAt: typeof record.lastDispatchAt === "number" ? record.lastDispatchAt : undefined,
     lastTickAt: typeof record.lastTickAt === "number" ? record.lastTickAt : undefined,
@@ -191,13 +259,17 @@ function normalizeState(raw: unknown): ControllerState {
     archiveLastFailures: normalizeArchiveFailures(record.archiveLastFailures),
     recentStartNotifications: normalizeStartNotifications(record.recentStartNotifications),
     startNotificationFailures: normalizeStartNotificationFailures(record.startNotificationFailures),
-    wakeFailures: normalizeWakeFailures(record.wakeFailures),
+    recentTerminalWakes: normalizeTerminalWakes(record.recentTerminalWakes),
+    terminalWakeFailures: normalizeTerminalWakeFailures(record.terminalWakeFailures ?? record.wakeFailures),
+    wakeFailures,
     counters: {
       ticks: typeof counters.ticks === "number" ? counters.ticks : 0,
       events: typeof counters.events === "number" ? counters.events : 0,
       dispatches: typeof counters.dispatches === "number" ? counters.dispatches : 0,
       wakes: typeof counters.wakes === "number" ? counters.wakes : 0,
       wakeErrors: typeof counters.wakeErrors === "number" ? counters.wakeErrors : 0,
+      terminalWakes: typeof counters.terminalWakes === "number" ? counters.terminalWakes : (typeof counters.wakes === "number" ? counters.wakes : 0),
+      terminalWakeErrors: typeof counters.terminalWakeErrors === "number" ? counters.terminalWakeErrors : (typeof counters.wakeErrors === "number" ? counters.wakeErrors : 0),
       errors: typeof counters.errors === "number" ? counters.errors : 0,
       archiveScans: typeof counters.archiveScans === "number" ? counters.archiveScans : 0,
       archiveCandidates: typeof counters.archiveCandidates === "number" ? counters.archiveCandidates : 0,
