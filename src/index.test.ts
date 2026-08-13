@@ -30,7 +30,7 @@ class MemoryStateStore implements StateStore {
   }
 }
 
-function makeRuntimeAgent() {
+function makeRuntimeAgent(options: { fail?: boolean } = {}) {
   const wakeRuns: Record<string, unknown>[] = [];
   return {
     wakeRuns,
@@ -39,6 +39,7 @@ function makeRuntimeAgent() {
       resolveAgentTimeoutMs: () => 120_000,
       runEmbeddedAgent: async (params: Record<string, unknown>) => {
         wakeRuns.push(params);
+        if (options.fail) throw new Error("embedded delivery failed");
         return { ok: true };
       },
     },
@@ -118,6 +119,43 @@ function doneCard(id: string, overrides: Partial<WorkboardArchiveCard> = {}): Wo
 
 function linkTo(type: "parent" | "child", targetCardId: string) {
   return { id: `${type}-${targetCardId}`, type, targetCardId, createdAt: 1 };
+}
+
+function completedEvent(id: string): Record<string, unknown> {
+  return { id, kind: "completed", createdAt: 1, message: "done" };
+}
+
+type StartNotificationGatewayOptions = {
+  eventBatches?: Array<Array<Record<string, unknown>>>;
+  started?: Array<Record<string, unknown>>;
+  cards?: Array<Record<string, unknown>>;
+  listError?: Error;
+  methods?: string[];
+  dispatchCalls?: { count: number };
+};
+
+function startNotificationGateway(options: StartNotificationGatewayOptions) {
+  let eventBatchIndex = 0;
+  return {
+    async request(method: string) {
+      options.methods?.push(method);
+      if (method === "workboard.notifications.subscribe") return { subscription: { id: "sub-start" } };
+      if (method === "workboard.notifications.events") {
+        const batches = options.eventBatches ?? [[completedEvent("evt-start")]];
+        return { events: structuredClone(batches[eventBatchIndex++] ?? []) };
+      }
+      if (method === "workboard.notifications.advance") return {};
+      if (method === "workboard.cards.dispatch") {
+        if (options.dispatchCalls) options.dispatchCalls.count += 1;
+        return { started: structuredClone(options.started ?? []), startFailures: [] };
+      }
+      if (method === "workboard.cards.list") {
+        if (options.listError) throw options.listError;
+        return { cards: structuredClone(options.cards ?? []) };
+      }
+      return {};
+    },
+  };
 }
 
 function archiveGateway(cards: WorkboardArchiveCard[], extra?: { failArchiveIds?: Set<string>; archives?: string[]; listCalls?: { count: number } }) {
@@ -306,7 +344,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0 }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifyEnabled: false }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -371,6 +409,266 @@ describe("WorkboardController", () => {
     expect(store.state.notifiedProblemIds).toEqual(["failed:evt-failed"]);
     expect(store.state.processedEventIds).toEqual(["evt-failed"]);
   });
+
+  it("sends a visible start notification for a single started card", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        started: [{ cardId: "card-2", title: "Next Card", sessionKey: "agent:main:workboard-card-2", runId: "run-2" }],
+      }),
+    });
+
+    const status = await controller.runOnce("unit-test");
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:owner", agentId: "main", trigger: "manual" });
+    expect(String(wakeRuns[0]?.prompt)).toContain("▶️ Workboard 已启动：Next Card\nID: card-2\nReason: unit-test");
+    expect(String(wakeRuns[0]?.prompt)).toContain("Do not work on the card");
+    expect(status.counters.startNotifications).toBe(1);
+    expect(status.recentStartNotifications).toMatchObject([{ cardId: "card-2", title: "Next Card", target: "agent:main:owner" }]);
+    expect(store.state.notifiedStartIds).toEqual(["run:run-2"]);
+  });
+
+  it("sends start notifications for multiple started cards", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        started: [
+          { cardId: "card-a", title: "Alpha", sessionKey: "agent:main:workboard-card-a", runId: "run-a" },
+          { cardId: "card-b", title: "Beta", sessionKey: "agent:main:workboard-card-b", runId: "run-b" },
+        ],
+      }),
+    });
+
+    const status = await controller.runOnce("multi");
+
+    expect(wakeRuns).toHaveLength(2);
+    expect(wakeRuns.map((run) => run.sessionKey)).toEqual(["agent:main:owner", "agent:main:owner"]);
+    expect(wakeRuns.map((run) => String(run.prompt))).toEqual([expect.stringContaining("ID: card-a"), expect.stringContaining("ID: card-b")]);
+    expect(status.counters.startNotifications).toBe(2);
+  });
+
+  it("deduplicates duplicate start identities in one envelope and repeated ticks", async () => {
+    const store = new MemoryStateStore();
+    const dispatchCalls = { count: 0 };
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[completedEvent("evt-1")], [completedEvent("evt-2")]],
+        dispatchCalls,
+        started: [
+          { cardId: "card-dup", title: "Duplicate", sessionKey: "agent:main:workboard-card-dup", runId: "run-dup" },
+          { cardId: "card-dup", title: "Duplicate", sessionKey: "agent:main:workboard-card-dup", runId: "run-dup" },
+        ],
+      }),
+    });
+
+    await controller.runOnce("first");
+    const status = await controller.runOnce("second");
+
+    expect(dispatchCalls.count).toBe(2);
+    expect(wakeRuns).toHaveLength(1);
+    expect(status.counters.startNotifications).toBe(1);
+    expect(store.state.notifiedStartIds).toEqual(["run:run-dup"]);
+  });
+
+  it("deduplicates start notifications after controller restart", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const first = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[completedEvent("evt-before-restart")]],
+        started: [{ cardId: "card-restart", title: "Restart", sessionKey: "agent:main:workboard-card-restart", runId: "run-restart" }],
+      }),
+    });
+    await first.runOnce("before-restart");
+
+    const second = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[completedEvent("evt-after-restart")]],
+        started: [{ cardId: "card-restart", title: "Restart", sessionKey: "agent:main:workboard-card-restart", runId: "run-restart" }],
+      }),
+    });
+    const status = await second.runOnce("after-restart");
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(status.counters.startNotifications).toBe(1);
+    expect(store.state.notifiedStartIds).toEqual(["run:run-restart"]);
+  });
+
+  it("does not send start notifications when disabled", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifyEnabled: false, startNotifySessionKey: "agent:main:owner" }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        started: [{ cardId: "card-muted", title: "Muted", sessionKey: "agent:main:workboard-card-muted", runId: "run-muted" }],
+      }),
+    });
+
+    const status = await controller.runOnce("disabled");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(status.counters.startNotifications).toBe(0);
+    expect(status.counters.startNotificationErrors).toBe(0);
+  });
+
+  it("resolves start notification targets by explicit, owner history, then fallback precedence", async () => {
+    async function runCase(input: {
+      config: Record<string, unknown>;
+      started: Record<string, unknown>;
+      cards?: Array<Record<string, unknown>>;
+    }) {
+      const store = new MemoryStateStore();
+      const methods: string[] = [];
+      const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+      const controller = new WorkboardController({
+        config: normalizeControllerConfig({ dispatchCooldownMs: 0, ...input.config }),
+        runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+        fullConfig: {},
+        stateStore: store,
+        runtimeAgent,
+        gateway: startNotificationGateway({ methods, started: [input.started], cards: input.cards }),
+      });
+      await controller.runOnce("target");
+      return { methods, wakeRuns };
+    }
+
+    const explicit = await runCase({
+      config: { startNotifySessionKey: "agent:main:explicit", wakeFallbackSessionKey: "agent:main:fallback" },
+      started: { cardId: "card-explicit", title: "Explicit", sessionKey: "agent:main:workboard-card-explicit", runId: "run-explicit" },
+      cards: [{ id: "card-explicit", sessionKey: "agent:main:owner" }],
+    });
+    expect(explicit.wakeRuns).toHaveLength(1);
+    expect(explicit.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:explicit" });
+    expect(explicit.methods).not.toContain("workboard.cards.list");
+
+    const owner = await runCase({
+      config: { wakeFallbackSessionKey: "agent:main:fallback" },
+      started: { cardId: "card-owner", title: "Owner", sessionKey: "agent:main:workboard-card-owner", runId: "run-owner" },
+      cards: [
+        {
+          id: "card-owner",
+          title: "Owner",
+          sessionKey: "agent:main:workboard-card-owner",
+          events: [{ kind: "created", at: 1, sessionKey: "agent:main:owner" }],
+        },
+      ],
+    });
+    expect(owner.wakeRuns).toHaveLength(1);
+    expect(owner.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:owner" });
+    expect(owner.methods).toContain("workboard.cards.list");
+
+    const fallback = await runCase({
+      config: { wakeFallbackSessionKey: "agent:main:fallback" },
+      started: { cardId: "card-fallback", title: "Fallback", sessionKey: "agent:main:workboard-card-fallback", runId: "run-fallback" },
+      cards: [{ id: "card-fallback", title: "Fallback", sessionKey: "agent:main:workboard-card-fallback" }],
+    });
+    expect(fallback.wakeRuns).toHaveLength(1);
+    expect(fallback.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:fallback" });
+  });
+
+  it("records visible failure when no reliable external start notification target exists", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        started: [{ cardId: "card-no-target", title: "No Target", sessionKey: "agent:main:workboard-card-no-target", runId: "run-no-target" }],
+        cards: [{ id: "card-no-target", title: "No Target", sessionKey: "agent:main:workboard-card-no-target" }],
+      }),
+    });
+
+    const status = await controller.runOnce("no-target");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(status.counters.dispatches).toBe(1);
+    expect(status.counters.startNotifications).toBe(0);
+    expect(status.counters.startNotificationErrors).toBe(1);
+    expect(status.lastError).toMatch(/start notification failed for card-no-target/);
+    expect(status.startNotificationFailures).toMatchObject([{ cardId: "card-no-target", title: "No Target" }]);
+  });
+
+  it("records visible failure without rolling back dispatch when start notification delivery fails", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent({ fail: true });
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        started: [{ cardId: "card-fail", title: "Delivery Fail", sessionKey: "agent:main:workboard-card-fail", runId: "run-fail" }],
+      }),
+    });
+
+    const status = await controller.runOnce("delivery-fail");
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(status.counters.dispatches).toBe(1);
+    expect(status.counters.startNotifications).toBe(0);
+    expect(status.counters.startNotificationErrors).toBe(1);
+    expect(status.lastError).toMatch(/embedded delivery failed/);
+    expect(status.startNotificationFailures).toMatchObject([{ cardId: "card-fail", target: "agent:main:owner", error: "embedded delivery failed" }]);
+  });
+
+  it("rejects worker session keys as start notification targets", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:workboard-card-worker", wakeFallbackSessionKey: "agent:main:owner" }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        started: [{ cardId: "card-worker", title: "Worker", sessionKey: "agent:main:workboard-card-worker", runId: "run-worker" }],
+      }),
+    });
+
+    const status = await controller.runOnce("worker-target");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(status.counters.startNotificationErrors).toBe(1);
+    expect(status.startNotificationFailures[0]?.error).toMatch(/could not resolve a reliable external owner session/);
+  });
+
 });
 
 

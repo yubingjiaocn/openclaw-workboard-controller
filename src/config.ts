@@ -2,7 +2,7 @@ import { Type } from "typebox";
 
 export const PLUGIN_ID = "workboard-controller";
 export const PLUGIN_NAME = "Workboard Controller";
-export const PLUGIN_DESCRIPTION = "Automatically dispatches Workboard ready cards after terminal events and wakes owners on problem events.";
+export const PLUGIN_DESCRIPTION = "Automatically dispatches Workboard ready cards after terminal events, notifies owners when cards start, and wakes owners on problem events.";
 export const SUPPORTED_OPENCLAW_VERSION = "2026.7.1-2";
 
 const DEFAULT_POLL_INTERVAL_MS = 15_000;
@@ -26,6 +26,8 @@ export const configSchema = Type.Object(
     dispatchTimeoutMs: Type.Optional(Type.Number({ description: "Gateway self-route timeout for Workboard dispatch in milliseconds. Default 60000." })),
     gatewayBaseUrl: Type.Optional(Type.String({ description: "Optional Gateway HTTP base URL for /tools/invoke and the controller self-route. Default http://127.0.0.1:${OPENCLAW_GATEWAY_PORT || gateway.port || 18789}." })),
     gatewayToolSessionKey: Type.Optional(Type.String({ description: "Session key passed to /tools/invoke for Workboard notification tool policy routing. Default main." })),
+    startNotifyEnabled: Type.Optional(Type.Boolean({ description: "Notify the owner/routing session when dispatch starts Workboard cards. Default true." })),
+    startNotifySessionKey: Type.Optional(Type.String({ description: "Explicit session key that receives Workboard card start notifications." })),
     wakeEnabled: Type.Optional(Type.Boolean({ description: "Wake owner sessions on failed/stale/blocked events. Default true." })),
     wakeFallbackSessionKey: Type.Optional(Type.String({ description: "Fallback session key when an event/card has no linked session." })),
     wakeFallbackAgentId: Type.Optional(Type.String({ description: "Fallback agent id when an event/card has no agent. Default main." })),
@@ -54,6 +56,8 @@ export type ControllerConfig = {
   dispatchTimeoutMs: number;
   gatewayBaseUrl?: string;
   gatewayToolSessionKey: string;
+  startNotifyEnabled: boolean;
+  startNotifySessionKey?: string;
   wakeEnabled: boolean;
   wakeFallbackSessionKey?: string;
   wakeFallbackAgentId: string;
@@ -109,6 +113,8 @@ export function normalizeControllerConfig(raw: unknown): ControllerConfig {
     dispatchTimeoutMs: optionalNumber(record, "dispatchTimeoutMs", DEFAULT_DISPATCH_TIMEOUT_MS, 1_000, 600_000),
     gatewayBaseUrl: optionalString(record, "gatewayBaseUrl"),
     gatewayToolSessionKey: optionalString(record, "gatewayToolSessionKey") ?? "main",
+    startNotifyEnabled: optionalBoolean(record, "startNotifyEnabled", true),
+    startNotifySessionKey: optionalString(record, "startNotifySessionKey"),
     wakeEnabled: optionalBoolean(record, "wakeEnabled", true),
     wakeFallbackSessionKey: optionalString(record, "wakeFallbackSessionKey"),
     wakeFallbackAgentId: optionalString(record, "wakeFallbackAgentId") ?? "main",

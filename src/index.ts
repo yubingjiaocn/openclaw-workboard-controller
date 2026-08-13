@@ -24,7 +24,7 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
       {
         name: "workboard_controller_status",
         label: "Workboard Controller Status",
-        description: "Return Workboard controller status, archive dry-run candidates, counters, and durable cursor state summary.",
+        description: "Return Workboard controller status, start notification history, archive dry-run candidates, counters, and durable cursor state summary.",
         parameters: Type.Object({}, { additionalProperties: false }),
         async execute() {
           return jsonResult(controller?.status() ?? { running: false, reason: "service not started" });

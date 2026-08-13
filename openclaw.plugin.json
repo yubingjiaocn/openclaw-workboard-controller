@@ -1,8 +1,8 @@
 {
   "id": "workboard-controller",
   "name": "Workboard Controller",
-  "description": "Automatically dispatches Workboard ready cards after terminal events and wakes owners on problem events.",
-  "version": "0.2.0",
+  "description": "Automatically dispatches Workboard ready cards after terminal events, notifies owners when cards start, and wakes owners on problem events.",
+  "version": "0.3.0",
   "activation": {
     "onStartup": true,
     "onConfigPaths": [
@@ -69,6 +69,14 @@
       "gatewayToolSessionKey": {
         "type": "string",
         "description": "Session key passed to /tools/invoke for Workboard notification tool policy routing. Default main."
+      },
+      "startNotifyEnabled": {
+        "type": "boolean",
+        "description": "Notify the owner/routing session when dispatch starts Workboard cards. Default true."
+      },
+      "startNotifySessionKey": {
+        "type": "string",
+        "description": "Explicit session key that receives Workboard card start notifications."
       },
       "wakeEnabled": {
         "type": "boolean",

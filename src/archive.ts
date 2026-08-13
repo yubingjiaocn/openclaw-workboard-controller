@@ -13,6 +13,8 @@ export type WorkboardArchiveEvent = {
   kind?: string;
   at?: number;
   toStatus?: string;
+  sessionKey?: string;
+  runId?: string;
 };
 
 export type WorkboardArchiveAttempt = {
@@ -27,7 +29,7 @@ export type WorkboardArchiveCard = {
   updatedAt?: number;
   completedAt?: number;
   events?: WorkboardArchiveEvent[];
-  execution?: { status?: string; updatedAt?: number };
+  execution?: { status?: string; updatedAt?: number; startedAt?: number };
   metadata?: {
     archivedAt?: number;
     links?: WorkboardArchiveLink[];

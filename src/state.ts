@@ -17,17 +17,35 @@ export type ArchiveFailure = {
   at: number;
 };
 
+export type StartNotificationRecord = {
+  cardId: string;
+  title?: string;
+  notifiedAt: number;
+  target: string;
+};
+
+export type StartNotificationFailure = {
+  cardId?: string;
+  title?: string;
+  target?: string;
+  error: string;
+  at: number;
+};
+
 export type ControllerState = {
   version: 1;
   subscriptionId?: string;
   processedEventIds: string[];
   notifiedProblemIds: string[];
+  notifiedStartIds: string[];
   lastDispatchAt?: number;
   lastTickAt?: number;
   lastArchiveScanAt?: number;
   lastError?: string;
   archiveCandidates: ArchiveCandidate[];
   archiveLastFailures: ArchiveFailure[];
+  recentStartNotifications: StartNotificationRecord[];
+  startNotificationFailures: StartNotificationFailure[];
   counters: {
     ticks: number;
     events: number;
@@ -38,6 +56,8 @@ export type ControllerState = {
     archiveCandidates: number;
     archiveActions: number;
     archiveErrors: number;
+    startNotifications: number;
+    startNotificationErrors: number;
   };
 };
 
@@ -52,9 +72,12 @@ export function emptyState(): ControllerState {
     version: 1,
     processedEventIds: [],
     notifiedProblemIds: [],
+    notifiedStartIds: [],
     archiveCandidates: [],
     archiveLastFailures: [],
-    counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0 },
+    recentStartNotifications: [],
+    startNotificationFailures: [],
+    counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
   };
 }
 
@@ -90,6 +113,35 @@ function normalizeArchiveFailures(value: unknown): ArchiveFailure[] {
   }).slice(-50);
 }
 
+function normalizeStartNotifications(value: unknown): StartNotificationRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry): StartNotificationRecord[] => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const cardId = typeof record.cardId === "string" ? record.cardId : undefined;
+    const title = typeof record.title === "string" ? record.title : undefined;
+    const notifiedAt = typeof record.notifiedAt === "number" && Number.isFinite(record.notifiedAt) ? record.notifiedAt : undefined;
+    const target = typeof record.target === "string" ? record.target : undefined;
+    if (!cardId || notifiedAt === undefined || !target) return [];
+    return [{ cardId, title, notifiedAt, target }];
+  }).slice(-50);
+}
+
+function normalizeStartNotificationFailures(value: unknown): StartNotificationFailure[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry): StartNotificationFailure[] => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const cardId = typeof record.cardId === "string" ? record.cardId : undefined;
+    const title = typeof record.title === "string" ? record.title : undefined;
+    const target = typeof record.target === "string" ? record.target : undefined;
+    const error = typeof record.error === "string" ? record.error : undefined;
+    const at = typeof record.at === "number" && Number.isFinite(record.at) ? record.at : undefined;
+    if (!error || at === undefined) return [];
+    return [{ cardId, title, target, error, at }];
+  }).slice(-50);
+}
+
 function normalizeState(raw: unknown): ControllerState {
   const fallback = emptyState();
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return fallback;
@@ -102,12 +154,15 @@ function normalizeState(raw: unknown): ControllerState {
     subscriptionId: typeof record.subscriptionId === "string" ? record.subscriptionId : undefined,
     processedEventIds: Array.isArray(record.processedEventIds) ? record.processedEventIds.filter((v): v is string => typeof v === "string").slice(-1000) : [],
     notifiedProblemIds: Array.isArray(record.notifiedProblemIds) ? record.notifiedProblemIds.filter((v): v is string => typeof v === "string").slice(-1000) : [],
+    notifiedStartIds: Array.isArray(record.notifiedStartIds) ? record.notifiedStartIds.filter((v): v is string => typeof v === "string").slice(-1000) : [],
     lastDispatchAt: typeof record.lastDispatchAt === "number" ? record.lastDispatchAt : undefined,
     lastTickAt: typeof record.lastTickAt === "number" ? record.lastTickAt : undefined,
     lastArchiveScanAt: typeof record.lastArchiveScanAt === "number" ? record.lastArchiveScanAt : undefined,
     lastError: typeof record.lastError === "string" ? record.lastError : undefined,
     archiveCandidates: normalizeArchiveCandidates(record.archiveCandidates),
     archiveLastFailures: normalizeArchiveFailures(record.archiveLastFailures),
+    recentStartNotifications: normalizeStartNotifications(record.recentStartNotifications),
+    startNotificationFailures: normalizeStartNotificationFailures(record.startNotificationFailures),
     counters: {
       ticks: typeof counters.ticks === "number" ? counters.ticks : 0,
       events: typeof counters.events === "number" ? counters.events : 0,
@@ -118,6 +173,8 @@ function normalizeState(raw: unknown): ControllerState {
       archiveCandidates: typeof counters.archiveCandidates === "number" ? counters.archiveCandidates : 0,
       archiveActions: typeof counters.archiveActions === "number" ? counters.archiveActions : 0,
       archiveErrors: typeof counters.archiveErrors === "number" ? counters.archiveErrors : 0,
+      startNotifications: typeof counters.startNotifications === "number" ? counters.startNotifications : 0,
+      startNotificationErrors: typeof counters.startNotificationErrors === "number" ? counters.startNotificationErrors : 0,
     },
   };
 }

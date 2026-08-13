@@ -72,6 +72,8 @@ for (const key of [
   "dispatchCooldownMs",
   "gatewayBaseUrl",
   "gatewayToolSessionKey",
+  "startNotifyEnabled",
+  "startNotifySessionKey",
   "wakeEnabled",
   "wakeFallbackAgentId",
   "archiveEnabled",
