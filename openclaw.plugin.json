@@ -1,0 +1,50 @@
+{
+  "id": "workboard-controller",
+  "name": "Workboard Controller",
+  "description": "Automatically dispatches Workboard ready cards after terminal events and wakes owners on problem events.",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true,
+    "onConfigPaths": [
+      "plugins.entries.workboard-controller"
+    ]
+  },
+  "contracts": {
+    "tools": [
+      "workboard_controller_status",
+      "workboard_controller_tick"
+    ],
+    "gatewayMethodDispatch": [
+      "authenticated-request"
+    ]
+  },
+  "toolMetadata": {
+    "workboard_controller_status": {
+      "optional": true
+    },
+    "workboard_controller_tick": {
+      "optional": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "description": "Start the controller service on Gateway startup. Default true." },
+      "boardId": { "type": "string", "description": "Workboard board id to watch. Default default." },
+      "subscriptionId": { "type": "string", "description": "Existing Workboard notification subscription id to reuse." },
+      "target": { "type": "string", "description": "Notification subscription target marker. Default workboard-controller." },
+      "pollIntervalMs": { "type": "number", "description": "Notification poll interval in milliseconds. Default 15000." },
+      "batchLimit": { "type": "number", "description": "Maximum Workboard notifications to process per tick. Default 50." },
+      "dispatchCooldownMs": { "type": "number", "description": "Minimum delay between dispatch calls. Default 2000." },
+      "dispatchTimeoutMs": { "type": "number", "description": "Gateway dispatch timeout in milliseconds. Default 60000." },
+      "wakeEnabled": { "type": "boolean", "description": "Wake owner sessions on failed/stale/blocked events. Default true." },
+      "wakeFallbackSessionKey": { "type": "string", "description": "Fallback session key when an event/card has no linked session." },
+      "wakeFallbackAgentId": { "type": "string", "description": "Fallback agent id when an event/card has no agent. Default main." },
+      "wakeTimeoutMs": { "type": "number", "description": "Problem wake embedded-agent timeout in milliseconds. Default 120000." },
+      "wakeToolsAllow": { "type": "array", "items": { "type": "string" }, "description": "Optional tool allowlist for problem wake runs." },
+      "compatibleOpenClawVersions": { "type": "array", "items": { "type": "string" }, "description": "Exact OpenClaw versions accepted by this compatibility seam." },
+      "allowUntestedOpenClawVersion": { "type": "boolean", "description": "Disable exact OpenClaw version fail-fast. Default false." }
+    }
+  }
+}
