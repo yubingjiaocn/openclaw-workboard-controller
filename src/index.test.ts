@@ -1134,7 +1134,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-start",
         dispatchCooldownMs: 0,
-        ownerRoutes: [{ boardId: "board-start", agentId: "may", sessionKey: "feishu:tenant-1:chat-abc" }],
+        ownerRoutes: [{ boardId: "board-start", agentId: "may", sessionKey: "agent:may:feishu:direct:ou_chat_abc" }],
         startNotifySessionKey: "agent:main:telegram:direct:legacy",
         wakeFallbackSessionKey: "agent:main:telegram:direct:fallback",
       }),
@@ -1153,7 +1153,7 @@ describe("WorkboardController", () => {
 
     expect(methods).toContain("workboard.cards.list");
     expect(wakeRuns).toHaveLength(1);
-    expect(wakeRuns[0]).toMatchObject({ sessionKey: "feishu:tenant-1:chat-abc", agentId: "may" });
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:may:feishu:direct:ou_chat_abc", agentId: "may" });
   });
 
   it("preserves opaque Feishu and QQ owner route session keys unchanged", async () => {
@@ -1667,8 +1667,9 @@ describe("owner session key validation", () => {
       "agent:owner:telegram:direct:123",
       "agent:owner:feishu:direct:ou_abc",
       "agent:owner:qq:direct:qq_456",
+      "agent:owner:qqbot:direct:qqbot_456",
       "agent:owner:dingtalk:direct:ding_789",
-      "feishu:tenant-1:chat-abc",
+      "agent:owner:future-channel:direct:opaque_abc",
     ]) {
       expect(isReliableExternalOwnerSessionKey(key)).toBe(true);
     }

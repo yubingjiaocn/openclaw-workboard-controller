@@ -31,9 +31,7 @@ export function isReliableExternalOwnerSessionKey(sessionKey: string, workerSess
   if (/^(?:cron|dashboard|acp)(?::|$)/.test(lower) || /:(?:cron|dashboard|acp)(?::|$)/.test(lower)) return false;
   if (/^agent:[^:]+(?::main)?$/.test(lower)) return false;
   if (isWorkboardWorkerSessionKey(normalized, cardId)) return false;
-  if (/^agent:[^:]+:(?:telegram|feishu|qq|dingtalk):direct:.+/.test(lower)) return true;
-  if (/^(?:telegram|feishu|qq|dingtalk):.+/.test(lower)) return true;
-  return false;
+  return /^agent:[^:]+:[^:]+:direct:.+$/.test(lower);
 }
 
 export function agentIdFromSessionKey(sessionKey: string): string | undefined {
