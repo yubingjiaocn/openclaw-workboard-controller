@@ -1,6 +1,6 @@
 {
   "name": "openclaw-plugin-workboard-controller",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "private": true,
   "description": "Local Workboard controller for OpenClaw terminal owner wakes, dispatch, start notifications, and archive planning.",

@@ -9,6 +9,7 @@ const DEFAULT_POLL_INTERVAL_MS = 15_000;
 const DEFAULT_LIMIT = 50;
 const DEFAULT_DISPATCH_COOLDOWN_MS = 2_000;
 const DEFAULT_WAKE_TIMEOUT_MS = 120_000;
+const DEFAULT_TERMINAL_WAKE_DEBOUNCE_MS = 1_000;
 const DEFAULT_DISPATCH_TIMEOUT_MS = 60_000;
 const DEFAULT_ARCHIVE_COMPLETED_GRAPH_AFTER_MS = 86_400_000;
 const DEFAULT_ARCHIVE_STANDALONE_AFTER_MS = 604_800_000;
@@ -40,6 +41,7 @@ export const configSchema = Type.Object(
     startNotifyEnabled: Type.Optional(Type.Boolean({ description: "Notify the owner/routing session when dispatch starts Workboard cards. Default true." })),
     startNotifySessionKey: Type.Optional(Type.String({ description: "Legacy global start-notification fallback used only when ownerRoutes has no match." })),
     terminalWakeEnabled: Type.Optional(Type.Boolean({ description: "Run an owner-session embedded-agent wake for terminal Workboard events: completed, failed, stale, dispatch blocked, and worker start failures. Default true; when absent, legacy wakeEnabled is honored." })),
+    terminalWakeDebounceMs: Type.Optional(Type.Number({ minimum: 0, maximum: 60_000, description: "Non-sliding terminal owner wake coalescing window in milliseconds, anchored at the first pending event for an idle owner. Default 1000." })),
     wakeEnabled: Type.Optional(Type.Boolean({ description: "Legacy alias for terminalWakeEnabled. Used only when terminalWakeEnabled is absent." })),
     wakeFallbackSessionKey: Type.Optional(Type.String({ description: "Legacy global fallback retained for start notification compatibility only. Terminal owner wakes require ownerRoutes." })),
     wakeFallbackAgentId: Type.Optional(Type.String({ description: "Fallback agent id when an event/card has no agent. Default main." })),
@@ -79,6 +81,7 @@ export type ControllerConfig = {
   startNotifyEnabled: boolean;
   startNotifySessionKey?: string;
   terminalWakeEnabled: boolean;
+  terminalWakeDebounceMs: number;
   wakeEnabled: boolean;
   wakeFallbackSessionKey?: string;
   wakeFallbackAgentId: string;
@@ -159,6 +162,7 @@ export function normalizeControllerConfig(raw: unknown): ControllerConfig {
     startNotifyEnabled: optionalBoolean(record, "startNotifyEnabled", true),
     startNotifySessionKey: optionalString(record, "startNotifySessionKey"),
     terminalWakeEnabled: optionalBoolean(record, "terminalWakeEnabled", optionalBoolean(record, "wakeEnabled", true)),
+    terminalWakeDebounceMs: optionalNumber(record, "terminalWakeDebounceMs", DEFAULT_TERMINAL_WAKE_DEBOUNCE_MS, 0, 60_000),
     wakeEnabled: optionalBoolean(record, "wakeEnabled", true),
     wakeFallbackSessionKey: optionalString(record, "wakeFallbackSessionKey"),
     wakeFallbackAgentId: optionalString(record, "wakeFallbackAgentId") ?? "main",

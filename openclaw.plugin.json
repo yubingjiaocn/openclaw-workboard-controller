@@ -2,7 +2,7 @@
   "id": "workboard-controller",
   "name": "Workboard Controller",
   "description": "Automatically dispatches Workboard ready cards after terminal events, wakes owner sessions for terminal results, and notifies owners when cards start.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "activation": {
     "onStartup": true,
     "onConfigPaths": [
@@ -110,6 +110,12 @@
       "terminalWakeEnabled": {
         "type": "boolean",
         "description": "Run an owner-session embedded-agent wake for terminal Workboard events: completed, failed, stale, dispatch blocked, and worker start failures. Default true; when absent, legacy wakeEnabled is honored."
+      },
+      "terminalWakeDebounceMs": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 60000,
+        "description": "Non-sliding terminal owner wake coalescing window in milliseconds, anchored at the first pending event for an idle owner. Default 1000."
       },
       "wakeEnabled": {
         "type": "boolean",

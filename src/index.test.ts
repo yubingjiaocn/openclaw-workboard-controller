@@ -2,7 +2,7 @@ import { once } from "node:events";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dispatchGatewayMethod } from "openclaw/plugin-sdk/gateway-method-runtime";
 import plugin from "./index.js";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { computeArchiveCandidates, type WorkboardArchiveCard } from "./archive.js";
 import { assertCompatibleOpenClawVersion, normalizeControllerConfig, SUPPORTED_OPENCLAW_VERSION } from "./config.js";
 import { WorkboardController } from "./controller.js";
@@ -44,6 +44,14 @@ function makeRuntimeAgent(options: { fail?: boolean } = {}) {
       },
     },
   };
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+async function flushAsyncWork(): Promise<void> {
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
 }
 
 type CapturedRequest = {
@@ -394,6 +402,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-complete",
         dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
         ownerRoutes: [{ boardId: "board-complete", agentId: "may", sessionKey: "agent:may:feishu:direct:ou_complete" }],
       }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
@@ -452,6 +461,7 @@ describe("WorkboardController", () => {
     const config = normalizeControllerConfig({
       boardId: "board-repeat",
       dispatchCooldownMs: 0,
+      terminalWakeDebounceMs: 0,
       ownerRoutes: [{ boardId: "board-repeat", sessionKey: "agent:main:telegram:direct:repeat-owner" }],
     });
 
@@ -497,6 +507,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-wake-fail",
         dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
         ownerRoutes: [{ boardId: "board-wake-fail", sessionKey: "agent:main:telegram:direct:wake-fail-owner" }],
       }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
@@ -534,6 +545,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-completed-worker",
         dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
         ownerRoutes: [{ boardId: "board-completed-worker", agentId: "main", sessionKey: "agent:main:workboard-card-completed-worker" }],
       }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
@@ -561,7 +573,7 @@ describe("WorkboardController", () => {
     const calls: string[] = [];
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:owner" }] }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, terminalWakeDebounceMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:owner" }] }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -589,6 +601,296 @@ describe("WorkboardController", () => {
     expect(calls.filter((method) => method === "workboard.notifications.advance")).toHaveLength(2);
     expect(store.state.notifiedProblemIds).toEqual(["event:evt-failed"]);
     expect(store.state.processedEventIds).toEqual(["evt-failed"]);
+  });
+
+  it("coalesces three near-simultaneous completions for the same owner into one non-sliding batch", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const dispatchCalls = { count: 0 };
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        dispatchCooldownMs: 0,
+        ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:batch-owner" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        dispatchCalls,
+        eventBatches: [[
+          { id: "evt-batch-1", kind: "completed", createdAt: 1, message: "one" },
+          { id: "evt-batch-2", kind: "completed", createdAt: 2, message: "two" },
+          { id: "evt-batch-3", kind: "completed", createdAt: 3, message: "three" },
+        ], [], []],
+      }),
+    });
+
+    let status = await controller.runOnce("batch-start");
+    expect(wakeRuns).toHaveLength(0);
+    expect(dispatchCalls.count).toBe(1);
+    expect(status.pendingTerminalEvents.total).toBe(3);
+    expect(status.counters.terminalEventsQueued).toBe(3);
+
+    vi.setSystemTime(999);
+    status = await controller.runOnce("not-yet");
+    expect(wakeRuns).toHaveLength(0);
+
+    vi.setSystemTime(1000);
+    status = await controller.runOnce("due");
+    await flushAsyncWork();
+    expect(wakeRuns).toHaveLength(1);
+    expect(String(wakeRuns[0].prompt)).toContain("batchSize: 3");
+    expect(status.counters.terminalWakeBatches).toBe(1);
+    expect(store.state.pendingTerminalEvents).toEqual([]);
+  });
+
+  it("wakes a short sibling after debounce and a later long sibling in a second batch", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:siblings" }] }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-short", kind: "completed", createdAt: 1, message: "short done" }], [], [{ id: "evt-long", kind: "completed", createdAt: 2, message: "long done" }], []],
+      }),
+    });
+
+    await controller.runOnce("short-arrives");
+    vi.setSystemTime(1000);
+    await controller.runOnce("short-due");
+    await flushAsyncWork();
+    expect(wakeRuns).toHaveLength(1);
+    expect(String(wakeRuns[0].prompt)).toContain("evt-short");
+
+    vi.setSystemTime(1500);
+    await controller.runOnce("long-arrives");
+    expect(wakeRuns).toHaveLength(1);
+
+    vi.setSystemTime(2500);
+    await controller.runOnce("long-due");
+    await flushAsyncWork();
+    expect(wakeRuns).toHaveLength(2);
+    expect(String(wakeRuns[1].prompt)).toContain("evt-long");
+  });
+
+  it("does not extend the first owner deadline under continuous arrivals", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:continuous" }] }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [
+          [{ id: "evt-cont-1", kind: "completed", createdAt: 1, message: "one" }],
+          [{ id: "evt-cont-2", kind: "completed", createdAt: 2, message: "two" }],
+          [{ id: "evt-cont-3", kind: "completed", createdAt: 3, message: "three" }],
+          [],
+        ],
+      }),
+    });
+
+    await controller.runOnce("first");
+    vi.setSystemTime(500);
+    await controller.runOnce("second");
+    vi.setSystemTime(999);
+    await controller.runOnce("third");
+    expect(wakeRuns).toHaveLength(0);
+
+    vi.setSystemTime(1000);
+    await controller.runOnce("first-deadline");
+    await flushAsyncWork();
+    expect(wakeRuns).toHaveLength(1);
+    expect(String(wakeRuns[0].prompt)).toContain("batchSize: 3");
+  });
+
+  it("allows mixed completed and failed terminal events in one owner batch", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:mixed" }] }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[
+          { id: "evt-mixed-completed", kind: "completed", createdAt: 1, message: "done" },
+          { id: "evt-mixed-failed", kind: "failed", createdAt: 2, message: "failed" },
+        ], []],
+      }),
+    });
+
+    await controller.runOnce("mixed-arrives");
+    vi.setSystemTime(1000);
+    const status = await controller.runOnce("mixed-due");
+    await flushAsyncWork();
+    expect(wakeRuns).toHaveLength(1);
+    expect(String(wakeRuns[0].prompt)).toContain("eventKind: completed");
+    expect(String(wakeRuns[0].prompt)).toContain("eventKind: failed");
+    expect(status.counters.terminalWakes).toBe(2);
+    expect(status.counters.terminalWakeBatches).toBe(1);
+  });
+
+  it("queues arrivals during an in-flight owner wake for a second immediate batch when overdue", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const wakeRuns: Record<string, unknown>[] = [];
+    const resolvers: Array<() => void> = [];
+    const runtimeAgent = {
+      resolveAgentWorkspaceDir: () => "/tmp/workspace",
+      resolveAgentTimeoutMs: () => 120_000,
+      runEmbeddedAgent: async (params: Record<string, unknown>) => {
+        wakeRuns.push(params);
+        await new Promise<void>((resolve) => resolvers.push(resolve));
+        return { ok: true };
+      },
+    };
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:inflight" }] }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-inflight-1", kind: "completed", createdAt: 1, message: "first" }], [], [{ id: "evt-inflight-2", kind: "completed", createdAt: 2, message: "second" }], []],
+      }),
+    });
+
+    await controller.runOnce("first-arrives");
+    vi.setSystemTime(1000);
+    let status = await controller.runOnce("first-due");
+    expect(wakeRuns).toHaveLength(1);
+    expect(status.inFlightOwnerWakes).toHaveLength(1);
+
+    vi.setSystemTime(1100);
+    status = await controller.runOnce("second-arrives");
+    expect(wakeRuns).toHaveLength(1);
+    expect(status.pendingTerminalEvents.total).toBe(2);
+
+    vi.setSystemTime(2200);
+    resolvers.shift()?.();
+    await flushAsyncWork();
+    expect(wakeRuns).toHaveLength(2);
+    expect(String(wakeRuns[1].prompt)).toContain("evt-inflight-2");
+    resolvers.shift()?.();
+    await flushAsyncWork();
+    expect(store.state.pendingTerminalEvents).toEqual([]);
+  });
+
+  it("delivers a pending terminal inbox after restart", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const config = normalizeControllerConfig({ dispatchCooldownMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:restart-pending" }] });
+
+    const before = new WorkboardController({
+      config,
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({ eventBatches: [[{ id: "evt-pending-restart", kind: "completed", createdAt: 1, message: "done" }]] }),
+    });
+    await before.runOnce("persist-before-restart");
+    expect(store.state.pendingTerminalEvents).toHaveLength(1);
+
+    vi.setSystemTime(1000);
+    const after = new WorkboardController({
+      config,
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({ eventBatches: [[]] }),
+    });
+    const status = await after.runOnce("after-restart");
+    await flushAsyncWork();
+    expect(wakeRuns).toHaveLength(1);
+    expect(status.pendingTerminalEvents.total).toBe(0);
+    expect(store.state.terminalWakeIds).toEqual(["event:evt-pending-restart"]);
+  });
+
+  it("retains pending terminal events after wake failure for later retry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent({ fail: true });
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, terminalWakeDebounceMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:retry" }] }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({ eventBatches: [[{ id: "evt-retry", kind: "completed", createdAt: 1, message: "done" }], []] }),
+    });
+
+    let status = await controller.runOnce("first-fails");
+    await flushAsyncWork();
+    expect(wakeRuns).toHaveLength(1);
+    expect(status.counters.terminalWakeErrors).toBe(1);
+    expect(store.state.pendingTerminalEvents).toMatchObject([{ wakeKey: "event:evt-retry", attemptCount: 1, lastError: "embedded delivery failed" }]);
+    expect(store.state.terminalWakeIds).toEqual([]);
+
+    vi.setSystemTime(999);
+    status = await controller.runOnce("backoff-not-yet");
+    expect(wakeRuns).toHaveLength(1);
+    expect(status.pendingTerminalEvents.total).toBe(1);
+  });
+
+  it("isolates two different owners into independent due batches", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-owners",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [
+          { boardId: "board-owners", agentId: "may", sessionKey: "agent:may:telegram:direct:owner-a" },
+          { boardId: "board-owners", agentId: "muriel", sessionKey: "agent:muriel:telegram:direct:owner-b" },
+        ],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[
+          { id: "evt-owner-a", kind: "completed", createdAt: 1, message: "a", cardId: "card-a" },
+          { id: "evt-owner-b", kind: "completed", createdAt: 2, message: "b", cardId: "card-b" },
+        ], []],
+        cards: [
+          { id: "card-a", boardId: "board-owners", agentId: "may", title: "Owner A" },
+          { id: "card-b", boardId: "board-owners", agentId: "muriel", title: "Owner B" },
+        ],
+      }),
+    });
+
+    await controller.runOnce("owners-arrive");
+    vi.setSystemTime(1000);
+    const status = await controller.runOnce("owners-due");
+    await flushAsyncWork();
+    expect(wakeRuns.map((run) => run.sessionKey)).toEqual(["agent:may:telegram:direct:owner-a", "agent:muriel:telegram:direct:owner-b"]);
+    expect(status.counters.terminalWakeBatches).toBe(2);
+    expect(status.pendingTerminalEvents.total).toBe(0);
   });
 
   it("sends a visible start notification for a single started card", async () => {
@@ -891,6 +1193,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-problem",
         dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
         ownerRoutes: [{ tenant: "tenant-may", boardId: "board-problem", agentId: "may", sessionKey: "agent:may:feishu:direct:problem-owner" }],
       }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
@@ -921,6 +1224,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-problem-all",
         dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
         ownerRoutes: [
           { boardId: "board-problem-all", agentId: "main", sessionKey: "agent:main:telegram:direct:8068735520" },
           { boardId: "board-problem-all", agentId: "may", sessionKey: "agent:may:feishu:direct:ou_abc123" },
@@ -951,12 +1255,12 @@ describe("WorkboardController", () => {
       "agent:may:feishu:direct:ou_abc123",
       "agent:muriel:qq:direct:qq_456",
       "agent:main:telegram:direct:8068735520",
-      "agent:main:telegram:direct:8068735520",
     ]);
     expect(String(wakeRuns[0].prompt)).toContain("Inspect the card/run");
     expect(String(wakeRuns[0].prompt)).toContain("maxRetries");
     expect(status.counters.wakes).toBe(4);
     expect(status.counters.terminalWakes).toBe(4);
+    expect(status.counters.terminalWakeBatches).toBe(3);
     expect(status.counters.wakeErrors).toBe(0);
   });
 
@@ -967,6 +1271,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-priority",
         dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
         ownerRoutes: [
           { tenant: "tenant-a", boardId: "board-priority", sessionKey: "agent:may:feishu:direct:tenant-board" },
           { boardId: "board-priority", agentId: "may", sessionKey: "agent:may:telegram:direct:board-agent" },
@@ -996,6 +1301,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-problem-worker",
         dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
         ownerRoutes: [{ boardId: "board-problem-worker", agentId: "main", sessionKey: "agent:main:workboard-card-problem-worker" }],
       }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
@@ -1023,6 +1329,7 @@ describe("WorkboardController", () => {
       config: normalizeControllerConfig({
         boardId: "board-problem-fallback-worker",
         dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
         wakeFallbackSessionKey: "agent:main:workboard-card-fallback-worker",
       }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
@@ -1047,7 +1354,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0 }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, terminalWakeDebounceMs: 0 }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -1144,7 +1451,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0 }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, terminalWakeDebounceMs: 0 }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -1167,7 +1474,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0 }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, terminalWakeDebounceMs: 0 }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,

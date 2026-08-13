@@ -76,6 +76,7 @@ for (const key of [
   "startNotifyEnabled",
   "startNotifySessionKey",
   "terminalWakeEnabled",
+  "terminalWakeDebounceMs",
   "wakeEnabled",
   "wakeFallbackAgentId",
   "archiveEnabled",

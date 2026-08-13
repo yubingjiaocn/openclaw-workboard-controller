@@ -50,6 +50,25 @@ export type TerminalWakeFailure = {
   at: number;
 };
 
+export type PendingTerminalEvent = {
+  wakeKey: string;
+  kind: string;
+  message: string;
+  firstObservedAt: number;
+  cardId?: string;
+  title?: string;
+  sessionKey?: string;
+  runId?: string;
+  ownerSessionKey?: string;
+  ownerAgentId?: string;
+  event?: Record<string, unknown>;
+  card?: Record<string, unknown>;
+  attemptCount: number;
+  lastAttemptAt?: number;
+  nextAttemptAt?: number;
+  lastError?: string;
+};
+
 export type WakeFailure = {
   problemKey: string;
   kind: string;
@@ -76,6 +95,7 @@ export type ControllerState = {
   startNotificationFailures: StartNotificationFailure[];
   recentTerminalWakes: TerminalWakeRecord[];
   terminalWakeFailures: TerminalWakeFailure[];
+  pendingTerminalEvents: PendingTerminalEvent[];
   wakeFailures: WakeFailure[];
   counters: {
     ticks: number;
@@ -92,6 +112,9 @@ export type ControllerState = {
     archiveErrors: number;
     startNotifications: number;
     startNotificationErrors: number;
+    terminalEventsQueued: number;
+    terminalWakeBatches: number;
+    terminalWakeBatchErrors: number;
   };
 };
 
@@ -114,8 +137,9 @@ export function emptyState(): ControllerState {
     startNotificationFailures: [],
     recentTerminalWakes: [],
     terminalWakeFailures: [],
+    pendingTerminalEvents: [],
     wakeFailures: [],
-    counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, terminalWakes: 0, terminalWakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
+    counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, terminalWakes: 0, terminalWakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0, terminalEventsQueued: 0, terminalWakeBatches: 0, terminalWakeBatchErrors: 0 },
   };
 }
 
@@ -216,6 +240,45 @@ function normalizeTerminalWakeFailures(value: unknown): TerminalWakeFailure[] {
   }).slice(-50);
 }
 
+function normalizeRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function normalizePendingTerminalEvents(value: unknown): PendingTerminalEvent[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const items = value.flatMap((entry): PendingTerminalEvent[] => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const wakeKey = typeof record.wakeKey === "string" ? record.wakeKey : undefined;
+    const kind = typeof record.kind === "string" ? record.kind : undefined;
+    const message = typeof record.message === "string" ? record.message : "";
+    const firstObservedAt = typeof record.firstObservedAt === "number" && Number.isFinite(record.firstObservedAt) ? record.firstObservedAt : undefined;
+    if (!wakeKey || !kind || firstObservedAt === undefined || seen.has(wakeKey)) return [];
+    seen.add(wakeKey);
+    const item: PendingTerminalEvent = {
+      wakeKey,
+      kind,
+      message,
+      firstObservedAt,
+      cardId: typeof record.cardId === "string" ? record.cardId : undefined,
+      title: typeof record.title === "string" ? record.title : undefined,
+      sessionKey: typeof record.sessionKey === "string" ? record.sessionKey : undefined,
+      runId: typeof record.runId === "string" ? record.runId : undefined,
+      ownerSessionKey: typeof record.ownerSessionKey === "string" ? record.ownerSessionKey : undefined,
+      ownerAgentId: typeof record.ownerAgentId === "string" ? record.ownerAgentId : undefined,
+      event: normalizeRecord(record.event),
+      card: normalizeRecord(record.card),
+      attemptCount: typeof record.attemptCount === "number" && Number.isFinite(record.attemptCount) ? Math.max(0, Math.trunc(record.attemptCount)) : 0,
+      lastAttemptAt: typeof record.lastAttemptAt === "number" && Number.isFinite(record.lastAttemptAt) ? record.lastAttemptAt : undefined,
+      nextAttemptAt: typeof record.nextAttemptAt === "number" && Number.isFinite(record.nextAttemptAt) ? record.nextAttemptAt : undefined,
+      lastError: typeof record.lastError === "string" ? record.lastError : undefined,
+    };
+    return [item];
+  });
+  return items.slice(-1000);
+}
+
 function normalizeWakeFailures(value: unknown): WakeFailure[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry): WakeFailure[] => {
@@ -261,6 +324,7 @@ function normalizeState(raw: unknown): ControllerState {
     startNotificationFailures: normalizeStartNotificationFailures(record.startNotificationFailures),
     recentTerminalWakes: normalizeTerminalWakes(record.recentTerminalWakes),
     terminalWakeFailures: normalizeTerminalWakeFailures(record.terminalWakeFailures ?? record.wakeFailures),
+    pendingTerminalEvents: normalizePendingTerminalEvents(record.pendingTerminalEvents),
     wakeFailures,
     counters: {
       ticks: typeof counters.ticks === "number" ? counters.ticks : 0,
@@ -277,6 +341,9 @@ function normalizeState(raw: unknown): ControllerState {
       archiveErrors: typeof counters.archiveErrors === "number" ? counters.archiveErrors : 0,
       startNotifications: typeof counters.startNotifications === "number" ? counters.startNotifications : 0,
       startNotificationErrors: typeof counters.startNotificationErrors === "number" ? counters.startNotificationErrors : 0,
+      terminalEventsQueued: typeof counters.terminalEventsQueued === "number" ? counters.terminalEventsQueued : 0,
+      terminalWakeBatches: typeof counters.terminalWakeBatches === "number" ? counters.terminalWakeBatches : 0,
+      terminalWakeBatchErrors: typeof counters.terminalWakeBatchErrors === "number" ? counters.terminalWakeBatchErrors : 0,
     },
   };
 }
