@@ -260,6 +260,8 @@ describe("WorkboardController", () => {
     await controller.runOnce("second");
 
     expect(wakeRuns).toHaveLength(1);
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "main" });
+    expect(wakeRuns[0].sessionId).toMatch(/^[0-9a-f-]{36}$/);
     expect(calls.filter((method) => method === "workboard.cards.dispatch")).toHaveLength(1);
     expect(calls.filter((method) => method === "workboard.notifications.advance")).toHaveLength(2);
     expect(store.state.notifiedProblemIds).toEqual(["failed:evt-failed"]);

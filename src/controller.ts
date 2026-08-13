@@ -261,7 +261,8 @@ export class WorkboardController {
     const timeoutMs = this.options.config.wakeTimeoutMs || this.options.runtimeAgent.resolveAgentTimeoutMs({ cfg: this.options.fullConfig });
     const prompt = buildWakePrompt(input);
     await this.options.runtimeAgent.runEmbeddedAgent({
-      sessionId: sessionKey ?? `workboard-controller-${input.kind}`,
+      // sessionId is a transcript identifier, not a routing sessionKey.
+      sessionId: randomUUID(),
       sessionKey,
       agentId,
       workspaceDir,
