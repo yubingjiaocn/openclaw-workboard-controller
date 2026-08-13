@@ -64,10 +64,10 @@ Required config changes are left to the main agent/operator. At minimum, enable 
           pollIntervalMs: 15000,
           gatewayToolSessionKey: "main",
           startNotifyEnabled: true,
-          // Preferred: route starts and problem wakes explicitly by owner route.
+          // Preferred: route start notifications and problem wakes explicitly by owner route.
           // Each sessionKey must be the full direct channel-specific owner session.
           ownerRoutes: [
-            { boardId: "default", agentId: "main", sessionKey: "agent:main:telegram:direct:8068735520" },
+            { tenant: "prod", boardId: "default", agentId: "main", sessionKey: "agent:main:telegram:direct:8068735520" },
             { boardId: "default", agentId: "may", sessionKey: "agent:may:feishu:direct:<may-direct-session-key>" },
             { boardId: "default", agentId: "muriel", sessionKey: "agent:muriel:qq:direct:<muriel-direct-session-key>" }
           ],
@@ -97,7 +97,7 @@ Gateway restart is required after changing plugin config.
 - `workboard_controller_status`: returns controller status, durable state path, counters including `wakeErrors`, last error, bounded `recentStartNotifications`, bounded `startNotificationFailures`, bounded `wakeFailures`, archive config summary, bounded `archiveCandidates`, and bounded `archiveLastFailures`.
 - `workboard_controller_tick`: runs one notification/dispatch pass manually. It runs an archive scan only if `archiveEnabled=true` and `archiveScanIntervalMs` is due.
 
-Both tools are optional and exist for local verification/debugging. The controller's Workboard notification polling calls use `/tools/invoke`; make sure Workboard notification tools are allowed for `gatewayToolSessionKey` (default `main`). Dispatch, list, and archive use Gateway-authenticated self-routes fixed to public Workboard Gateway RPC methods. Dispatch does not call the public `workboard_dispatch` tool. Start notifications and problem wakes use the same channel-agnostic `ownerRoutes` resolver. Each route must provide the full direct `sessionKey` plus at least one match dimension: `tenant`, `boardId`, or `agentId`. All supplied dimensions must match; more dimensions wins (`tenant+boardId+agentId` over two dimensions over one), and equal specificity uses declaration order. Start target precedence is `ownerRoutes`, then legacy `startNotifySessionKey`, then legacy `wakeFallbackSessionKey`; problem wake precedence is `ownerRoutes`, then legacy `wakeFallbackSessionKey`. Worker/subagent session keys are rejected, including `card.sessionKey`, `card.execution.sessionKey`, event worker session keys, and the dispatch `started.sessionKey`. If no reliable route exists, the controller records a visible start/wake failure instead of guessing `agent:<id>:main` or reusing Workboard worker linkage.
+Both tools are optional and exist for local verification/debugging. The controller's Workboard notification polling calls use `/tools/invoke`; make sure Workboard notification tools are allowed for `gatewayToolSessionKey` (default `main`). Dispatch, list, and archive use Gateway-authenticated self-routes fixed to public Workboard Gateway RPC methods. Dispatch does not call the public `workboard_dispatch` tool. Start notifications and problem wakes use the same channel-agnostic `ownerRoutes` resolver. Each route must provide the full direct `sessionKey` plus at least one match dimension: `tenant`, `boardId`, or `agentId`. All supplied dimensions must match; route priority is `tenant+boardId+agentId`, then `boardId+agentId`, then `tenant+boardId` or `tenant+agentId`, then single-dimension `tenant`, `boardId`, or `agentId`; equal priority uses declaration order. Start target precedence is `ownerRoutes`, then legacy `startNotifySessionKey`, then legacy `wakeFallbackSessionKey`; problem wake precedence is `ownerRoutes`, then legacy `wakeFallbackSessionKey`. Worker/subagent session keys are rejected, including `card.sessionKey`, `card.execution.sessionKey`, event worker session keys, and the dispatch `started.sessionKey`. If no reliable route exists, the controller records a visible start/wake failure instead of guessing `agent:<id>:main` or reusing Workboard worker linkage.
 
 ## Known Limits
 

@@ -651,10 +651,6 @@ function workerSessionKeys(input: { started?: StartedWorkboardCard; card?: Workb
   })));
 }
 
-function routeSpecificity(route: OwnerRoute): number {
-  return [route.tenant, route.boardId, route.agentId].filter(Boolean).length;
-}
-
 function routeMatches(route: OwnerRoute, context: OwnerRouteContext): boolean {
   if (route.tenant && route.tenant !== context.tenant) return false;
   if (route.boardId && route.boardId !== context.boardId) return false;
@@ -662,15 +658,26 @@ function routeMatches(route: OwnerRoute, context: OwnerRouteContext): boolean {
   return true;
 }
 
+function routePriority(route: OwnerRoute): number {
+  const hasTenant = Boolean(route.tenant);
+  const hasBoard = Boolean(route.boardId);
+  const hasAgent = Boolean(route.agentId);
+  if (hasTenant && hasBoard && hasAgent) return 5;
+  if (hasBoard && hasAgent) return 4;
+  if (hasTenant && (hasBoard || hasAgent)) return 3;
+  if (hasTenant || hasBoard || hasAgent) return 2;
+  return 0;
+}
+
 function selectOwnerRoute(routes: OwnerRoute[], context: OwnerRouteContext): OwnerRoute | undefined {
   let selected: OwnerRoute | undefined;
-  let selectedSpecificity = 0;
+  let selectedPriority = 0;
   for (const route of routes) {
     if (!routeMatches(route, context)) continue;
-    const specificity = routeSpecificity(route);
-    if (specificity > selectedSpecificity) {
+    const priority = routePriority(route);
+    if (priority > selectedPriority) {
       selected = route;
-      selectedSpecificity = specificity;
+      selectedPriority = priority;
     }
   }
   return selected;

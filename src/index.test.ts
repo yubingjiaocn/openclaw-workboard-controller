@@ -129,6 +129,7 @@ type StartNotificationGatewayOptions = {
   eventBatches?: Array<Array<Record<string, unknown>>>;
   started?: Array<Record<string, unknown>>;
   startFailures?: Array<Record<string, unknown>>;
+  blocked?: Array<Record<string, unknown>>;
   cards?: Array<Record<string, unknown>>;
   listError?: Error;
   methods?: string[];
@@ -148,7 +149,7 @@ function startNotificationGateway(options: StartNotificationGatewayOptions) {
       if (method === "workboard.notifications.advance") return {};
       if (method === "workboard.cards.dispatch") {
         if (options.dispatchCalls) options.dispatchCalls.count += 1;
-        return { started: structuredClone(options.started ?? []), startFailures: structuredClone(options.startFailures ?? []) };
+        return { started: structuredClone(options.started ?? []), blocked: structuredClone(options.blocked ?? []), startFailures: structuredClone(options.startFailures ?? []) };
       }
       if (method === "workboard.cards.list") {
         if (options.listError) throw options.listError;
@@ -388,7 +389,7 @@ describe("WorkboardController", () => {
     const calls: string[] = [];
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, wakeFallbackSessionKey: "main" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, wakeFallbackSessionKey: "agent:main:telegram:direct:owner" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -398,7 +399,7 @@ describe("WorkboardController", () => {
           calls.push(method);
           if (method === "workboard.notifications.subscribe") return { subscription: { id: "sub-1" } };
           if (method === "workboard.notifications.events") {
-            return { events: [{ id: "evt-failed", kind: "failed", createdAt: 1, message: "failed", sessionKey: "main" }] };
+            return { events: [{ id: "evt-failed", kind: "failed", createdAt: 1, message: "failed", sessionKey: "agent:main:workboard-card-failed" }] };
           }
           if (method === "workboard.cards.dispatch") return {};
           return {};
@@ -410,7 +411,7 @@ describe("WorkboardController", () => {
     await controller.runOnce("second");
 
     expect(wakeRuns).toHaveLength(1);
-    expect(wakeRuns[0]).toMatchObject({ sessionKey: "main" });
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:telegram:direct:owner" });
     expect(wakeRuns[0].sessionId).toMatch(/^[0-9a-f-]{36}$/);
     expect(calls.filter((method) => method === "workboard.cards.dispatch")).toHaveLength(1);
     expect(calls.filter((method) => method === "workboard.notifications.advance")).toHaveLength(2);
@@ -647,6 +648,36 @@ describe("WorkboardController", () => {
     expect(tie.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:telegram:direct:first" });
   });
 
+  it("resolves ownerRoutes before legacy start notification fallbacks", async () => {
+    const store = new MemoryStateStore();
+    const methods: string[] = [];
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-start",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [{ boardId: "board-start", agentId: "may", sessionKey: "feishu:tenant-1:chat-abc" }],
+        startNotifySessionKey: "agent:main:legacy",
+        wakeFallbackSessionKey: "agent:main:fallback",
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        methods,
+        started: [{ cardId: "card-start", title: "Start", sessionKey: "agent:may:workboard-card-start", runId: "run-start" }],
+        cards: [{ id: "card-start", agentId: "may", title: "Start" }],
+      }),
+    });
+
+    await controller.runOnce("start-route");
+
+    expect(methods).toContain("workboard.cards.list");
+    expect(wakeRuns).toHaveLength(1);
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "feishu:tenant-1:chat-abc", agentId: "may" });
+  });
+
   it("preserves opaque Feishu and QQ owner route session keys unchanged", async () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
@@ -709,6 +740,132 @@ describe("WorkboardController", () => {
     expect(wakeRuns[0]).not.toMatchObject({ sessionKey: "agent:may:workboard-card-problem" });
     expect(status.counters.wakes).toBe(1);
     expect(status.counters.wakeErrors).toBe(0);
+  });
+
+  it("routes failed stale blocked and startFailure problem wakes through ownerRoutes with opaque session keys", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-problem-all",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [
+          { boardId: "board-problem-all", agentId: "main", sessionKey: "agent:main:telegram:direct:8068735520" },
+          { boardId: "board-problem-all", agentId: "may", sessionKey: "agent:may:feishu:direct:ou_abc123" },
+          { boardId: "board-problem-all", agentId: "muriel", sessionKey: "agent:muriel:qq:direct:qq_456" },
+        ],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[
+          { id: "evt-failed-may", kind: "failed", createdAt: 1, message: "failed", sessionKey: "agent:may:workboard-card-failed", runId: "run-failed" },
+          { id: "evt-stale-muriel", kind: "stale", createdAt: 2, message: "stale", cardId: "card-stale", sessionKey: "agent:muriel:workboard-card-stale", runId: "run-stale" },
+        ]],
+        cards: [
+          { id: "card-failed", boardId: "board-problem-all", agentId: "may", title: "Failed", sessionKey: "agent:may:workboard-card-failed", execution: { runId: "run-failed", sessionKey: "agent:may:workboard-card-failed" } },
+          { id: "card-stale", boardId: "board-problem-all", agentId: "muriel", title: "Stale", sessionKey: "agent:muriel:workboard-card-stale", execution: { runId: "run-stale", sessionKey: "agent:muriel:workboard-card-stale" } },
+        ],
+        blocked: [{ id: "card-blocked", boardId: "board-problem-all", agentId: "main", title: "Blocked", status: "blocked", updatedAt: 123, sessionKey: "agent:main:workboard-card-blocked" }],
+        startFailures: [{ cardId: "card-start-failure", error: "worker boot failed", card: { id: "card-start-failure", boardId: "board-problem-all", agentId: "main", title: "Start Failure", sessionKey: "agent:main:workboard-card-start-failure" } }],
+      }),
+    });
+
+    const status = await controller.runOnce("problem-all-routes");
+
+    expect(wakeRuns.map((run) => run.sessionKey)).toEqual([
+      "agent:may:feishu:direct:ou_abc123",
+      "agent:muriel:qq:direct:qq_456",
+      "agent:main:telegram:direct:8068735520",
+      "agent:main:telegram:direct:8068735520",
+    ]);
+    expect(status.counters.wakes).toBe(4);
+    expect(status.counters.wakeErrors).toBe(0);
+  });
+
+  it("prefers board and agent owner routes over tenant and board routes for problem wakes", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-priority",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [
+          { tenant: "tenant-a", boardId: "board-priority", sessionKey: "agent:may:feishu:direct:tenant-board" },
+          { boardId: "board-priority", agentId: "may", sessionKey: "agent:may:telegram:direct:board-agent" },
+          { tenant: "tenant-a", sessionKey: "agent:may:qq:direct:tenant" },
+        ],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-priority", kind: "failed", createdAt: 1, message: "failed", runId: "run-priority" }]],
+        cards: [{ id: "card-priority", boardId: "board-priority", agentId: "may", title: "Priority", execution: { runId: "run-priority", sessionKey: "agent:may:workboard-card-priority" }, metadata: { tenant: "tenant-a" } }],
+      }),
+    });
+
+    await controller.runOnce("problem-priority");
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:may:telegram:direct:board-agent", agentId: "may" });
+  });
+
+  it("rejects ownerRoutes problem wake targets that are worker session keys", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-problem-worker",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [{ boardId: "board-problem-worker", agentId: "main", sessionKey: "agent:main:workboard-card-problem-worker" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-problem-worker", kind: "failed", createdAt: 1, message: "failed", sessionKey: "agent:main:workboard-card-problem-worker", runId: "run-problem-worker" }]],
+        cards: [{ id: "card-problem-worker", boardId: "board-problem-worker", agentId: "main", title: "Problem Worker", sessionKey: "agent:main:workboard-card-problem-worker", execution: { runId: "run-problem-worker", sessionKey: "agent:main:workboard-card-problem-worker" } }],
+      }),
+    });
+
+    const status = await controller.runOnce("problem-worker-target");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(status.counters.wakeErrors).toBe(1);
+    expect(status.wakeFailures[0]).toMatchObject({ target: "agent:main:workboard-card-problem-worker" });
+    expect(status.wakeFailures[0]?.error).toMatch(/ownerRoutes target rejected as a worker session/);
+  });
+
+  it("rejects wakeFallbackSessionKey problem wake targets that are worker session keys", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-problem-fallback-worker",
+        dispatchCooldownMs: 0,
+        wakeFallbackSessionKey: "agent:main:workboard-card-fallback-worker",
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-problem-fallback-worker", kind: "failed", createdAt: 1, message: "failed", sessionKey: "agent:main:workboard-card-fallback-worker", runId: "run-fallback-worker" }]],
+        cards: [{ id: "card-fallback-worker", boardId: "board-problem-fallback-worker", agentId: "main", title: "Fallback Worker", sessionKey: "agent:main:workboard-card-fallback-worker", execution: { runId: "run-fallback-worker", sessionKey: "agent:main:workboard-card-fallback-worker" } }],
+      }),
+    });
+
+    const status = await controller.runOnce("problem-fallback-worker-target");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(status.counters.wakeErrors).toBe(1);
+    expect(status.wakeFailures[0]).toMatchObject({ target: "agent:main:workboard-card-fallback-worker" });
+    expect(status.wakeFailures[0]?.error).toMatch(/wakeFallbackSessionKey target rejected as a worker session/);
   });
 
   it("records visible failure when no reliable external start notification target exists", async () => {

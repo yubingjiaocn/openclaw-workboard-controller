@@ -97,7 +97,7 @@
             "sessionKey"
           ]
         },
-        "description": "Channel-agnostic owner routing table. Each entry must include sessionKey and at least one of tenant, boardId, or agentId. More matching dimensions wins; equal specificity uses declaration order."
+        "description": "Channel-agnostic owner routing table. Each entry must include sessionKey and at least one of tenant, boardId, or agentId. Match priority is tenant+boardId+agentId, then boardId+agentId, then tenant+boardId or tenant+agentId, then single dimensions; equal priority uses declaration order."
       },
       "startNotifyEnabled": {
         "type": "boolean",
@@ -105,7 +105,7 @@
       },
       "startNotifySessionKey": {
         "type": "string",
-        "description": "Explicit session key that receives Workboard card start notifications."
+        "description": "Legacy global start-notification fallback used only when ownerRoutes has no match."
       },
       "wakeEnabled": {
         "type": "boolean",
@@ -113,7 +113,7 @@
       },
       "wakeFallbackSessionKey": {
         "type": "string",
-        "description": "Fallback session key when an event/card has no linked session."
+        "description": "Legacy global problem-wake fallback used only when ownerRoutes has no match."
       },
       "wakeFallbackAgentId": {
         "type": "string",
