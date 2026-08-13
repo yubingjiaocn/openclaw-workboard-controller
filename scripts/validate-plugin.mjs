@@ -23,7 +23,7 @@ assert(typeof plugin.register === "function", "entry must expose register(api)")
 assert(pkg.openclaw?.extensions?.includes("./dist/index.js"), "package.json must expose ./dist/index.js in openclaw.extensions");
 
 const tools = manifest.contracts?.tools ?? [];
-for (const tool of ["workboard_controller_status", "workboard_controller_tick"]) {
+for (const tool of ["workboard_controller_status", "workboard_controller_tick", "workboard_create_owned", "workboard_owner_bind"]) {
   assert(tools.includes(tool), `manifest contracts.tools must include ${tool}`);
   assert(manifest.toolMetadata?.[tool]?.optional === true, `${tool} must be marked optional`);
 }
@@ -46,6 +46,7 @@ for (const routePath of [
   "/plugins/workboard-controller/workboard-dispatch",
   "/plugins/workboard-controller/workboard-list",
   "/plugins/workboard-controller/workboard-archive",
+  "/plugins/workboard-controller/workboard-create",
 ]) {
   const route = httpRoutes.find((entry) => entry.path === routePath);
   assert(route, `plugin must register ${routePath}`);
@@ -63,6 +64,8 @@ assert(gatewayClientSource.includes("WORKBOARD_DISPATCH_ROUTE_PATH"), "productio
 assert(dispatchSharedSource.includes("/plugins/workboard-controller/workboard-dispatch"), "production dispatch path must call the authenticated self-route");
 assert(gatewaySharedSource.includes("/plugins/workboard-controller/workboard-list"), "production list path must call the authenticated self-route");
 assert(gatewaySharedSource.includes("/plugins/workboard-controller/workboard-archive"), "production archive path must call the authenticated self-route");
+assert(gatewaySharedSource.includes("/plugins/workboard-controller/workboard-create"), "production create path must call the authenticated self-route");
+assert(gatewayClientSource.includes("workboard.cards.create"), "owned create path must call workboard.cards.create through the Gateway client");
 
 const properties = manifest.configSchema?.properties ?? {};
 for (const key of [

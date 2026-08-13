@@ -2,7 +2,7 @@
   "id": "workboard-controller",
   "name": "Workboard Controller",
   "description": "Automatically dispatches Workboard ready cards after terminal events, wakes owner sessions for terminal results, and notifies owners when cards start.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "activation": {
     "onStartup": true,
     "onConfigPaths": [
@@ -12,7 +12,9 @@
   "contracts": {
     "tools": [
       "workboard_controller_status",
-      "workboard_controller_tick"
+      "workboard_controller_tick",
+      "workboard_create_owned",
+      "workboard_owner_bind"
     ],
     "gatewayMethodDispatch": [
       "authenticated-request"
@@ -23,6 +25,12 @@
       "optional": true
     },
     "workboard_controller_tick": {
+      "optional": true
+    },
+    "workboard_create_owned": {
+      "optional": true
+    },
+    "workboard_owner_bind": {
       "optional": true
     }
   },

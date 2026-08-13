@@ -4,6 +4,7 @@ import { computeArchiveCandidates, type WorkboardArchiveCard } from "./archive.j
 import type { ControllerConfig, OwnerRoute } from "./config.js";
 import { assertCompatibleOpenClawVersion } from "./config.js";
 import type { GatewayMethodClient } from "./gateway-method-client.js";
+import { agentIdFromSessionKey, isReliableExternalOwnerSessionKey, isWorkboardWorkerSessionKey, optionalSessionKey, type OwnerBinding, type OwnerBindingSource } from "./owner-binding.js";
 import { errorMessage } from "./gateway-method-client.js";
 import type { ArchiveFailure, ControllerState, PendingTerminalEvent, StartNotificationFailure, StateStore, TerminalWakeFailure, TerminalWakeRecord } from "./state.js";
 import { rememberBounded } from "./state.js";
@@ -85,7 +86,7 @@ type OwnerRouteContext = {
 };
 
 type OwnerTargetResolution =
-  | { status: "target"; sessionKey: string; agentId: string; source: "ownerRoutes" | "legacy-startNotifySessionKey" | "legacy-wakeFallbackSessionKey" }
+  | { status: "target"; sessionKey: string; agentId: string; source: "ownerBinding" | "ownerRoutes" | "legacy-startNotifySessionKey" | "legacy-wakeFallbackSessionKey" }
   | { status: "rejected"; error: string; target?: string }
   | { status: "none" };
 
@@ -125,6 +126,11 @@ export type ControllerStatus = {
   pendingTerminalEvents: PendingTerminalEventsStatus;
   inFlightOwnerWakes: InFlightOwnerWake[];
   wakeFailures: ControllerState["wakeFailures"];
+  ownerBindings: {
+    total: number;
+    bySource: Record<string, number>;
+    recent: Array<{ cardId: string; source: string; ownerAgentId?: string; createdAt: number; updatedAt?: number; inheritedFromCardId?: string }>;
+  };
   archive: {
     enabled: boolean;
     dryRun: boolean;
@@ -205,6 +211,7 @@ export class WorkboardController {
       pendingTerminalEvents: pendingTerminalEventsStatus(state?.pendingTerminalEvents ?? [], this.options.config.terminalWakeDebounceMs),
       inFlightOwnerWakes: Array.from(this.inFlightOwnerWakes.values()).map((wake) => ({ ...wake, wakeKeys: [...wake.wakeKeys] })),
       wakeFailures: state?.wakeFailures ?? [],
+      ownerBindings: ownerBindingsStatus(state?.ownerBindings ?? []),
       archive: {
         enabled: this.options.config.archiveEnabled,
         dryRun: this.options.config.archiveDryRun,
@@ -216,6 +223,39 @@ export class WorkboardController {
       },
       inFlight: this.inFlight,
     };
+  }
+
+  async bindOwner(input: { cardId: string; ownerSessionKey: string; ownerAgentId?: string; source: OwnerBindingSource; inheritedFromCardId?: string }): Promise<OwnerBinding> {
+    const cardId = optionalSessionKey(input.cardId);
+    const ownerSessionKey = optionalSessionKey(input.ownerSessionKey);
+    if (!cardId) throw new Error("cardId must be a non-empty string");
+    if (!ownerSessionKey || !isReliableExternalOwnerSessionKey(ownerSessionKey, [], cardId)) {
+      throw new Error("ownerSessionKey must be a reliable external direct session key");
+    }
+    const state = await this.requireState();
+    const now = Date.now();
+    const existing = state.ownerBindings.find((binding) => binding.cardId === cardId);
+    const binding: OwnerBinding = {
+      cardId,
+      ownerSessionKey,
+      ownerAgentId: optionalSessionKey(input.ownerAgentId) ?? agentIdFromSessionKey(ownerSessionKey),
+      source: input.source,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: existing ? now : undefined,
+      inheritedFromCardId: optionalSessionKey(input.inheritedFromCardId),
+    };
+    state.ownerBindings = [...state.ownerBindings.filter((entry) => entry.cardId !== cardId), binding].slice(-5000);
+    await this.save();
+    return binding;
+  }
+
+  async createOwnedCard(params: Record<string, unknown>, ownerSessionKey: string, ownerAgentId?: string): Promise<unknown> {
+    if (!isReliableExternalOwnerSessionKey(ownerSessionKey)) throw new Error("ownerSessionKey must be a reliable external direct session key");
+    const payload = await this.options.gateway.request<{ card?: { id?: string } }>("workboard.cards.create", params);
+    const cardId = optionalSessionKey(payload.card?.id);
+    if (!cardId) throw new Error("workboard.cards.create returned no card id");
+    await this.bindOwner({ cardId, ownerSessionKey, ownerAgentId, source: "owned-tool" });
+    return payload;
   }
 
   async runOnce(reason = "manual"): Promise<ControllerStatus> {
@@ -423,7 +463,7 @@ export class WorkboardController {
 
     let cardsById = new Map<string, WorkboardCard>();
     let listError: string | undefined;
-    if (this.options.config.ownerRoutes.length) {
+    if (this.options.config.ownerRoutes.length || state.ownerBindings.length) {
       try {
         const payload = await this.options.gateway.request<WorkboardListPayload>("workboard.cards.list", { boardId: this.options.config.boardId });
         cardsById = new Map((payload.cards ?? []).map((card) => [card.id, card]));
@@ -438,7 +478,7 @@ export class WorkboardController {
       if (state.notifiedStartIds.includes(identity)) continue;
       const listedCard = cardsById.get(cardId);
       const title = startedCardTitle(entry.card, listedCard);
-      const target = this.resolveStartNotificationTarget(entry.card, listedCard);
+      const target = await this.resolveStartNotificationTarget(entry.card, listedCard, cardsById);
       if (target.status !== "target") {
         const error = target.status === "rejected"
           ? target.error
@@ -475,10 +515,13 @@ export class WorkboardController {
     }
   }
 
-  private resolveStartNotificationTarget(started: StartedWorkboardCard, card?: WorkboardCard): OwnerTargetResolution {
+  private async resolveStartNotificationTarget(started: StartedWorkboardCard, card?: WorkboardCard, cardsById = new Map<string, WorkboardCard>()): Promise<OwnerTargetResolution> {
     const cardId = startedCardId(started) ?? card?.id;
     const context = this.ownerRouteContext({ started, card });
-    const routeTarget = this.resolveConfiguredOwnerRoute(context, workerSessionKeys({ started, card }), cardId);
+    const workerKeys = workerSessionKeys({ started, card });
+    const bindingTarget = await this.resolveBoundOwnerTarget(cardId, workerKeys, context, card, cardsById);
+    if (bindingTarget.status !== "none") return bindingTarget;
+    const routeTarget = this.resolveConfiguredOwnerRoute(context, workerKeys, cardId);
     if (routeTarget.status !== "none") return routeTarget;
 
     const explicit = optionalSessionKey(this.options.config.startNotifySessionKey);
@@ -528,7 +571,7 @@ export class WorkboardController {
     const card = contextResult.card ?? input.card;
     const cardId = input.cardId ?? card?.id;
     const title = terminalWakeTitle(input, card);
-    const target = this.resolveTerminalWakeTarget(input, card);
+    const target = await this.resolveTerminalWakeTarget(input, card);
     const pending: PendingTerminalEvent = {
       wakeKey: input.wakeKey,
       kind: input.kind,
@@ -607,7 +650,7 @@ export class WorkboardController {
     if (card && !event.card) event.card = serializableRecord(card);
     if (!event.cardId && card?.id) event.cardId = card.id;
     if (!event.title) event.title = terminalWakeTitle(input, card);
-    const target = this.resolveTerminalWakeTarget(input, card);
+    const target = await this.resolveTerminalWakeTarget(input, card);
     if (target.status !== "none" || !contextResult.lookupError) return target;
     return { status: "rejected", error: `could not resolve owner route after workboard.cards.list failed: ${contextResult.lookupError}` };
   }
@@ -682,7 +725,7 @@ export class WorkboardController {
     event.nextAttemptAt = at + terminalWakeBackoffMs(event.attemptCount);
   }
 
-  private resolveTerminalWakeTarget(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard }, card?: WorkboardCard): OwnerTargetResolution {
+  private async resolveTerminalWakeTarget(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard }, card?: WorkboardCard): Promise<OwnerTargetResolution> {
     const cardId = input.cardId ?? card?.id ?? input.card?.id;
     const context = this.ownerRouteContext({ card: card ?? input.card });
     const eventSessionKey = optionalSessionKey(input.sessionKey);
@@ -690,7 +733,48 @@ export class WorkboardController {
       card: card ?? input.card,
       extra: eventSessionKey && isWorkboardWorkerSessionKey(eventSessionKey, cardId) ? [eventSessionKey] : [],
     });
+    const bindingTarget = await this.resolveBoundOwnerTarget(cardId, workerKeys, context, card ?? input.card);
+    if (bindingTarget.status !== "none") return bindingTarget;
     return this.resolveConfiguredOwnerRoute(context, workerKeys, cardId);
+  }
+
+  private async resolveBoundOwnerTarget(cardId: string | undefined, workerKeys: string[], context: OwnerRouteContext, card?: WorkboardCard, cardsById = new Map<string, WorkboardCard>()): Promise<OwnerTargetResolution> {
+    const state = await this.requireState();
+    const binding = await this.findOrInheritOwnerBinding(cardId, card, cardsById);
+    if (!binding) return { status: "none" };
+    if (!isReliableExternalOwnerSessionKey(binding.ownerSessionKey, workerKeys, cardId)) {
+      return { status: "rejected", target: binding.ownerSessionKey, error: "owner binding target rejected as a worker session: " + binding.ownerSessionKey };
+    }
+    const liveBinding = state.ownerBindings.find((entry) => entry.cardId === binding.cardId) ?? binding;
+    return { status: "target", sessionKey: liveBinding.ownerSessionKey, agentId: liveBinding.ownerAgentId ?? this.targetAgentId(liveBinding.ownerSessionKey, context), source: "ownerBinding" };
+  }
+
+  private async findOrInheritOwnerBinding(cardId?: string, card?: WorkboardCard, cardsById = new Map<string, WorkboardCard>()): Promise<OwnerBinding | undefined> {
+    const state = await this.requireState();
+    const directCardId = optionalSessionKey(cardId ?? card?.id);
+    if (!directCardId) return undefined;
+    const direct = state.ownerBindings.find((binding) => binding.cardId === directCardId);
+    if (direct) return direct;
+    const seen = new Set<string>([directCardId]);
+    let current = card ?? cardsById.get(directCardId);
+    for (let depth = 0; depth < 8; depth += 1) {
+      const parentId = createdByCardIdFromCard(current);
+      if (!parentId || seen.has(parentId)) return undefined;
+      seen.add(parentId);
+      const parentBinding = state.ownerBindings.find((binding) => binding.cardId === parentId);
+      if (parentBinding) {
+        return await this.bindOwner({
+          cardId: directCardId,
+          ownerSessionKey: parentBinding.ownerSessionKey,
+          ownerAgentId: parentBinding.ownerAgentId,
+          source: "inherited",
+          inheritedFromCardId: parentId,
+        });
+      }
+      current = cardsById.get(parentId);
+      if (!current) return undefined;
+    }
+    return undefined;
   }
 
   private async recordTerminalWakeFailure(failure: TerminalWakeFailure): Promise<void> {
@@ -734,12 +818,14 @@ export class WorkboardController {
     try {
       const payload = await this.options.gateway.request<WorkboardListPayload>("workboard.cards.list", { boardId: this.options.config.boardId });
       const cards = payload.cards ?? [];
+      const cardsById = new Map(cards.map((entry) => [entry.id, entry]));
       const card = cards.find((candidate) => {
         if (cardId && candidate.id === cardId) return true;
         if (runId && (candidate.runId === runId || candidate.execution?.runId === runId)) return true;
         if (sessionKey && (candidate.sessionKey === sessionKey || candidate.execution?.sessionKey === sessionKey)) return true;
         return false;
       });
+      if (card) await this.findOrInheritOwnerBinding(card.id, card, cardsById);
       return { card };
     } catch (error) {
       return { lookupError: errorMessage(error) };
@@ -750,9 +836,6 @@ export class WorkboardController {
 }
 
 
-function optionalSessionKey(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
 
 function startedCardId(card: StartedWorkboardCard): string | undefined {
   return optionalSessionKey(card.id) ?? optionalSessionKey(card.cardId);
@@ -787,6 +870,12 @@ function tenantFromCard(card: unknown): string | undefined {
   const record = asRecord(card);
   const metadata = asRecord(record.metadata);
   return optionalSessionKey(record.tenant) ?? optionalSessionKey(metadata.tenant) ?? optionalSessionKey(metadata.tenantId);
+}
+
+function createdByCardIdFromCard(card: unknown): string | undefined {
+  const metadata = asRecord(asRecord(card).metadata);
+  const automation = asRecord(metadata.automation);
+  return optionalSessionKey(automation.createdByCardId) ?? optionalSessionKey(metadata.createdByCardId);
 }
 
 function workerSessionKeys(input: { started?: StartedWorkboardCard; card?: WorkboardCard; extra?: unknown[] }): string[] {
@@ -835,24 +924,6 @@ function selectOwnerRoute(routes: OwnerRoute[], context: OwnerRouteContext): Own
   return selected;
 }
 
-function isWorkboardWorkerSessionKey(sessionKey: string, cardId?: string): boolean {
-  const normalized = sessionKey.toLowerCase();
-  if (normalized.startsWith("subagent:") || normalized.includes(":subagent:")) return true;
-  if (normalized.includes("workboard-")) return true;
-  return Boolean(cardId && normalized.includes(cardId.toLowerCase()) && normalized.includes("workboard"));
-}
-
-function isReliableExternalOwnerSessionKey(sessionKey: string, workerSessionKeys: string[] = [], cardId?: string): boolean {
-  const normalized = optionalSessionKey(sessionKey);
-  if (!normalized) return false;
-  if (workerSessionKeys.includes(normalized)) return false;
-  return !isWorkboardWorkerSessionKey(normalized, cardId);
-}
-
-function agentIdFromSessionKey(sessionKey: string): string | undefined {
-  const match = /^agent:([^:]+):/.exec(sessionKey.trim());
-  return match?.[1];
-}
 
 function formatStartNotification(input: { cardId: string; title: string; reason: string }): string {
   const lines = [`▶️ Workboard 已启动：${input.title}`, `ID: ${input.cardId}`];
@@ -925,6 +996,23 @@ function terminalEventDueAt(event: PendingTerminalEvent, debounceMs: number): nu
 
 function isPendingTerminalEventDue(event: PendingTerminalEvent, now: number, debounceMs: number): boolean {
   return isPendingTerminalEventAvailable(event, now) && terminalEventDueAt(event, debounceMs) <= now;
+}
+
+function ownerBindingsStatus(bindings: OwnerBinding[]): ControllerStatus["ownerBindings"] {
+  const bySource: Record<string, number> = {};
+  for (const binding of bindings) bySource[binding.source] = (bySource[binding.source] ?? 0) + 1;
+  return {
+    total: bindings.length,
+    bySource,
+    recent: bindings.slice(-20).map((binding) => ({
+      cardId: binding.cardId,
+      source: binding.source,
+      ownerAgentId: binding.ownerAgentId,
+      createdAt: binding.createdAt,
+      updatedAt: binding.updatedAt,
+      inheritedFromCardId: binding.inheritedFromCardId,
+    })),
+  };
 }
 
 function pendingTerminalEventsStatus(events: PendingTerminalEvent[], debounceMs: number): PendingTerminalEventsStatus {

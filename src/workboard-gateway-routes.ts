@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dispatchGatewayMethod, type GatewayMethodDispatchResponse } from "openclaw/plugin-sdk/gateway-method-runtime";
 import { errorMessage } from "./gateway-method-client.js";
-import { normalizeWorkboardArchiveRequestBody, normalizeWorkboardListRequestBody } from "./workboard-gateway-shared.js";
+import { normalizeWorkboardArchiveRequestBody, normalizeWorkboardCreateRequestBody, normalizeWorkboardListRequestBody } from "./workboard-gateway-shared.js";
 
 type DispatchGatewayMethod = typeof dispatchGatewayMethod;
 type BodyNormalizer = (value: unknown) => Record<string, unknown>;
@@ -93,4 +93,8 @@ export function createWorkboardListRouteHandler(dispatch: DispatchGatewayMethod 
 
 export function createWorkboardArchiveRouteHandler(dispatch: DispatchGatewayMethod = dispatchGatewayMethod) {
   return createGatewayRouteHandler("workboard.cards.archive", normalizeWorkboardArchiveRequestBody, dispatch);
+}
+
+export function createWorkboardCreateRouteHandler(dispatch: DispatchGatewayMethod = dispatchGatewayMethod) {
+  return createGatewayRouteHandler("workboard.cards.create", normalizeWorkboardCreateRequestBody, dispatch);
 }

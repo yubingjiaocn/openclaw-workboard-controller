@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { OwnerBinding } from "./owner-binding.js";
 
 export type ArchiveCandidate = {
   componentId: string;
@@ -97,6 +98,7 @@ export type ControllerState = {
   terminalWakeFailures: TerminalWakeFailure[];
   pendingTerminalEvents: PendingTerminalEvent[];
   wakeFailures: WakeFailure[];
+  ownerBindings: OwnerBinding[];
   counters: {
     ticks: number;
     events: number;
@@ -139,6 +141,7 @@ export function emptyState(): ControllerState {
     terminalWakeFailures: [],
     pendingTerminalEvents: [],
     wakeFailures: [],
+    ownerBindings: [],
     counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, terminalWakes: 0, terminalWakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0, terminalEventsQueued: 0, terminalWakeBatches: 0, terminalWakeBatchErrors: 0 },
   };
 }
@@ -244,6 +247,40 @@ function normalizeRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }
 
+function normalizeOwnerBindingEntry(entry: unknown, fallbackCardId?: string): OwnerBinding[] {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+  const record = entry as Record<string, unknown>;
+  const cardId = typeof record.cardId === "string" && record.cardId.trim() ? record.cardId.trim() : fallbackCardId;
+  const ownerSessionKey = typeof record.ownerSessionKey === "string" && record.ownerSessionKey.trim()
+    ? record.ownerSessionKey.trim()
+    : typeof record.sessionKey === "string" && record.sessionKey.trim()
+      ? record.sessionKey.trim()
+      : undefined;
+  if (!cardId || !ownerSessionKey) return [];
+  const source = record.source === "owned-tool" || record.source === "core-hook" || record.source === "manual" || record.source === "inherited" ? record.source : "manual";
+  const createdAt = typeof record.createdAt === "number" && Number.isFinite(record.createdAt) ? record.createdAt : Date.now();
+  return [{
+    cardId,
+    ownerSessionKey,
+    ownerAgentId: typeof record.ownerAgentId === "string" && record.ownerAgentId.trim() ? record.ownerAgentId.trim() : undefined,
+    source,
+    createdAt,
+    updatedAt: typeof record.updatedAt === "number" && Number.isFinite(record.updatedAt) ? record.updatedAt : undefined,
+    inheritedFromCardId: typeof record.inheritedFromCardId === "string" && record.inheritedFromCardId.trim() ? record.inheritedFromCardId.trim() : undefined,
+  }];
+}
+
+function normalizeOwnerBindings(value: unknown): OwnerBinding[] {
+  const items = Array.isArray(value)
+    ? value.flatMap((entry) => normalizeOwnerBindingEntry(entry))
+    : value && typeof value === "object"
+      ? Object.entries(value as Record<string, unknown>).flatMap(([cardId, entry]) => normalizeOwnerBindingEntry(entry, cardId))
+      : [];
+  const byCardId = new Map<string, OwnerBinding>();
+  for (const item of items) byCardId.set(item.cardId, item);
+  return Array.from(byCardId.values()).slice(-5000);
+}
+
 function normalizePendingTerminalEvents(value: unknown): PendingTerminalEvent[] {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
@@ -326,6 +363,7 @@ function normalizeState(raw: unknown): ControllerState {
     terminalWakeFailures: normalizeTerminalWakeFailures(record.terminalWakeFailures ?? record.wakeFailures),
     pendingTerminalEvents: normalizePendingTerminalEvents(record.pendingTerminalEvents),
     wakeFailures,
+    ownerBindings: normalizeOwnerBindings(record.ownerBindings ?? record.ownerBindingByCardId),
     counters: {
       ticks: typeof counters.ticks === "number" ? counters.ticks : 0,
       events: typeof counters.events === "number" ? counters.events : 0,

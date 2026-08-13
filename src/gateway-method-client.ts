@@ -2,8 +2,10 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { normalizeWorkboardDispatchRequestBody, WORKBOARD_DISPATCH_ROUTE_PATH } from "./workboard-dispatch-shared.js";
 import {
   normalizeWorkboardArchiveRequestBody,
+  normalizeWorkboardCreateRequestBody,
   normalizeWorkboardListRequestBody,
   WORKBOARD_ARCHIVE_ROUTE_PATH,
+  WORKBOARD_CREATE_ROUTE_PATH,
   WORKBOARD_LIST_ROUTE_PATH,
 } from "./workboard-gateway-shared.js";
 
@@ -118,6 +120,10 @@ function buildWorkboardArchiveRouteUrl(baseUrl: string): string {
   return `${baseUrl}${WORKBOARD_ARCHIVE_ROUTE_PATH}`;
 }
 
+function buildWorkboardCreateRouteUrl(baseUrl: string): string {
+  return `${baseUrl}${WORKBOARD_CREATE_ROUTE_PATH}`;
+}
+
 function toolForMethod(method: string): string {
   const tool = METHOD_TO_TOOL[method];
   if (!tool) throw new Error(`unsupported gateway method for Workboard tool invoke client: ${method}`);
@@ -184,6 +190,7 @@ export function createGatewayMethodClient(options: GatewayMethodClientOptions): 
   const workboardDispatchRouteUrl = buildWorkboardDispatchRouteUrl(baseUrl);
   const workboardListRouteUrl = buildWorkboardListRouteUrl(baseUrl);
   const workboardArchiveRouteUrl = buildWorkboardArchiveRouteUrl(baseUrl);
+  const workboardCreateRouteUrl = buildWorkboardCreateRouteUrl(baseUrl);
   const auth = resolveGatewayHttpAuth(options.config, env);
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) throw new Error("global fetch is unavailable for gateway HTTP client");
@@ -197,13 +204,21 @@ export function createGatewayMethodClient(options: GatewayMethodClientOptions): 
       try {
         const headers: Record<string, string> = { "content-type": "application/json" };
         if (auth.kind === "bearer") headers.authorization = `Bearer ${auth.value}`;
-        if (method === "workboard.cards.dispatch" || method === "workboard.cards.list" || method === "workboard.cards.archive") {
-          const route = method === "workboard.cards.dispatch" ? workboardDispatchRouteUrl : method === "workboard.cards.list" ? workboardListRouteUrl : workboardArchiveRouteUrl;
+        if (method === "workboard.cards.dispatch" || method === "workboard.cards.list" || method === "workboard.cards.archive" || method === "workboard.cards.create") {
+          const route = method === "workboard.cards.dispatch"
+            ? workboardDispatchRouteUrl
+            : method === "workboard.cards.list"
+              ? workboardListRouteUrl
+              : method === "workboard.cards.archive"
+                ? workboardArchiveRouteUrl
+                : workboardCreateRouteUrl;
           const body = method === "workboard.cards.dispatch"
             ? normalizeWorkboardDispatchRequestBody(params ?? {})
             : method === "workboard.cards.list"
               ? normalizeWorkboardListRequestBody(params ?? {})
-              : normalizeWorkboardArchiveRequestBody(params ?? {});
+              : method === "workboard.cards.archive"
+                ? normalizeWorkboardArchiveRequestBody(params ?? {})
+                : normalizeWorkboardCreateRequestBody(params ?? {});
           const response = await fetchImpl(route, {
             method: "POST",
             headers,

@@ -20,9 +20,9 @@ Terminal owner wakes are enabled by `terminalWakeEnabled` and cover:
 
 ## Routing
 
-Terminal wakes use `ownerRoutes` only. Route matching uses the v0.3.0 resolver: every configured dimension must match, with priority `tenant+boardId+agentId`, then `boardId+agentId`, then `tenant+boardId` or `tenant+agentId`, then single dimensions; declaration order breaks ties.
+Terminal wakes use durable controller-owned card bindings first, then `ownerRoutes`. Route matching uses the v0.3.0 resolver: every configured dimension must match, with priority `tenant+boardId+agentId`, then `boardId+agentId`, then `tenant+boardId` or `tenant+agentId`, then single dimensions; declaration order breaks ties.
 
-Worker/subagent session keys are rejected as terminal wake destinations, including public card session keys, execution session keys, event session keys, and dispatch `started.sessionKey`. If no owner route exists, the controller records a visible terminal wake failure and leaves the event pending for bounded-backoff retry. It does not guess `main`, use `wakeFallbackSessionKey`, or deliver to a worker session.
+Worker/subagent session keys are rejected as owner binding, owner route, and terminal wake destinations, including public card session keys, execution session keys, event session keys, and dispatch `started.sessionKey`. If no owner route exists, the controller records a visible terminal wake failure and leaves the event pending for bounded-backoff retry. It does not guess `main`, use `wakeFallbackSessionKey`, or deliver to a worker session.
 
 ## Processing Order
 
@@ -48,3 +48,12 @@ The controller does not inspect worktrees or files, reserve paths, detect parall
 Notification wake identity is `event:<event.id>`. Dispatch `blocked` and `startFailure` identities are stable from card/update/error data. Pending inbox entries are de-duplicated by wake identity. Identities are stored in `terminalWakeIds` only after successful delivery so delivered wakes do not repeat across ticks or restarts. Legacy `notifiedProblemIds` are migrated into `terminalWakeIds` to avoid re-waking old failed/stale/blocked events after upgrade.
 
 Status exposes `pendingTerminalEvents` with bounded per-owner counts, `inFlightOwnerWakes`, queued terminal event counters (`terminalEventsQueued`), delivered terminal event counters (`terminalWakes`/legacy `wakes`), batched wake counters (`terminalWakeBatches`), wake error counters (`terminalWakeErrors`/legacy `wakeErrors`), bounded `recentTerminalWakes`, and bounded `terminalWakeFailures`. Legacy `wakeFailures` remains for compatibility and mirrors terminal wake failures.
+
+
+## v0.6.0 Card Owner Bindings
+
+OpenClaw 2026.7.1-2 Workboard cards do not preserve unknown metadata fields, so this plugin stores card owner bindings in its own durable state file as `cardId -> ownerSessionKey` plus bounded provenance fields. The stored `ownerSessionKey` is opaque and channel-specific; the controller preserves it exactly and does not synthesize or normalize provider suffixes.
+
+Binding sources are `owned-tool`, `core-hook`, `manual`, and `inherited`. `workboard_create_owned` calls the authenticated plugin self-route for `workboard.cards.create` and persists only after the Gateway method succeeds. The best-effort `before_tool_call` / `after_tool_call` hook path correlates ordinary `workboard_create` calls by `toolCallId` and skips capture when the trusted current session key looks like a worker/subagent/workboard session. Hooks do not mutate core tool parameters.
+
+When resolving a terminal wake or start notification target, the controller checks the durable card binding first, then configured owner routes, then legacy start-notification fallbacks where applicable. A bound target is still rejected if it equals observed worker linkage or matches worker/subagent/workboard session-key patterns. For child cards without a direct binding, `metadata.automation.createdByCardId` is followed with bounded cycle-safe traversal against public card list data; an inherited binding is persisted for future events.

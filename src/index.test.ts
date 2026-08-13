@@ -8,12 +8,14 @@ import { assertCompatibleOpenClawVersion, normalizeControllerConfig, SUPPORTED_O
 import { WorkboardController } from "./controller.js";
 import { createGatewayMethodClient } from "./gateway-method-client.js";
 import { createWorkboardDispatchRouteHandler } from "./workboard-dispatch-route.js";
-import { createWorkboardArchiveRouteHandler, createWorkboardListRouteHandler } from "./workboard-gateway-routes.js";
+import { createWorkboardArchiveRouteHandler, createWorkboardCreateRouteHandler, createWorkboardListRouteHandler } from "./workboard-gateway-routes.js";
 import { normalizeWorkboardDispatchRequestBody, WORKBOARD_DISPATCH_ROUTE_PATH } from "./workboard-dispatch-shared.js";
 import {
   normalizeWorkboardArchiveRequestBody,
+  normalizeWorkboardCreateRequestBody,
   normalizeWorkboardListRequestBody,
   WORKBOARD_ARCHIVE_ROUTE_PATH,
+  WORKBOARD_CREATE_ROUTE_PATH,
   WORKBOARD_LIST_ROUTE_PATH,
 } from "./workboard-gateway-shared.js";
 import type { ControllerState, StateStore } from "./state.js";
@@ -1651,6 +1653,154 @@ describe("WorkboardController archive scan", () => {
 
     expect(listCalls.count).toBe(1);
     expect(store.state.counters.archiveScans).toBe(1);
+  });
+});
+
+
+
+describe("owner bindings", () => {
+  it("persists explicit owned create bindings only after Gateway create succeeds", async () => {
+    const store = new MemoryStateStore();
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const { runtimeAgent } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ enabled: false }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: {
+        async request(method, params) {
+          calls.push({ method, params });
+          if (method === "workboard.cards.create") return { card: { id: "card-owned", title: "Owned" } };
+          return {};
+        },
+      },
+    });
+
+    const payload = await controller.createOwnedCard({ title: "Owned", agentId: "worker-agent" }, "agent:owner:telegram:direct:123", "owner");
+
+    expect(payload).toEqual({ card: { id: "card-owned", title: "Owned" } });
+    expect(calls).toEqual([{ method: "workboard.cards.create", params: { title: "Owned", agentId: "worker-agent" } }]);
+    expect(store.state.ownerBindings).toMatchObject([{ cardId: "card-owned", ownerSessionKey: "agent:owner:telegram:direct:123", ownerAgentId: "owner", source: "owned-tool" }]);
+
+    await expect(controller.createOwnedCard({ title: "Bad" }, "agent:owner:workboard-card-bad")).rejects.toThrow(/reliable external/);
+  });
+
+  it("does not bind when owned create fails", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ enabled: false }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: { async request() { throw new Error("create denied"); } },
+    });
+
+    await expect(controller.createOwnedCard({ title: "Nope" }, "agent:owner:telegram:direct:123")).rejects.toThrow(/create denied/);
+    expect(store.state.ownerBindings).toEqual([]);
+  });
+
+  it("prefers durable binding over ownerRoutes for terminal wakes and start notifications", async () => {
+    const store = new MemoryStateStore();
+    store.state.ownerBindings = [{ cardId: "card-bound", ownerSessionKey: "agent:bound:telegram:direct:1", ownerAgentId: "bound", source: "manual", createdAt: 1 }];
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-bound",
+        dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
+        ownerRoutes: [{ boardId: "board-bound", sessionKey: "agent:route:telegram:direct:2" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-bound", kind: "completed", createdAt: 1, message: "done", cardId: "card-bound" }]],
+        started: [{ cardId: "card-bound", title: "Bound", sessionKey: "agent:main:workboard-card-bound", runId: "run-bound" }],
+        cards: [{ id: "card-bound", boardId: "board-bound", agentId: "main", title: "Bound", sessionKey: "agent:main:workboard-card-bound" }],
+      }),
+    });
+
+    await controller.runOnce("binding-precedence");
+    await flushAsyncWork();
+
+    expect(wakeRuns.map((run) => run.sessionKey)).toEqual(["agent:bound:telegram:direct:1", "agent:bound:telegram:direct:1"]);
+  });
+
+  it("inherits ancestor owner binding from metadata.automation.createdByCardId", async () => {
+    const store = new MemoryStateStore();
+    store.state.ownerBindings = [{ cardId: "parent", ownerSessionKey: "agent:parent:telegram:direct:1", ownerAgentId: "parent", source: "manual", createdAt: 1 }];
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ boardId: "board-inherit", dispatchCooldownMs: 0, terminalWakeDebounceMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-child", kind: "completed", createdAt: 1, message: "done", cardId: "child" }]],
+        cards: [
+          { id: "parent", boardId: "board-inherit", title: "Parent" },
+          { id: "child", boardId: "board-inherit", title: "Child", metadata: { automation: { createdByCardId: "parent" } } },
+        ],
+      }),
+    });
+
+    await controller.runOnce("inherit");
+    await flushAsyncWork();
+
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:parent:telegram:direct:1" });
+    expect(store.state.ownerBindings).toMatchObject([
+      { cardId: "parent", source: "manual" },
+      { cardId: "child", source: "inherited", inheritedFromCardId: "parent", ownerSessionKey: "agent:parent:telegram:direct:1" },
+    ]);
+  });
+
+  it("persists bindings across controller restart", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent } = makeRuntimeAgent();
+    const config = normalizeControllerConfig({ enabled: false });
+    const first = new WorkboardController({ config, runtimeVersion: SUPPORTED_OPENCLAW_VERSION, fullConfig: {}, stateStore: store, runtimeAgent, gateway: { async request() { return {}; } } });
+    await first.bindOwner({ cardId: "card-restart-bind", ownerSessionKey: "agent:owner:telegram:direct:restart", source: "manual" });
+    const second = new WorkboardController({ config, runtimeVersion: SUPPORTED_OPENCLAW_VERSION, fullConfig: {}, stateStore: store, runtimeAgent, gateway: { async request() { return {}; } } });
+    await second.start();
+    expect(second.status().ownerBindings).toMatchObject({ total: 1, bySource: { manual: 1 } });
+  });
+
+  it("auto-captures core workboard_create by toolCallId and skips worker sessions", async () => {
+    const tools = new Map<string, Record<string, unknown>>();
+    const hooks: Record<string, Function> = {};
+    const services: Array<{ start: Function; stop?: Function }> = [];
+    const stateDir = await import("node:fs/promises").then((fs) => fs.mkdtemp("/tmp/workboard-controller-test-"));
+    (plugin.register as (api: Record<string, unknown>) => void)({
+      registrationMode: "full",
+      pluginConfig: { enabled: false },
+      config: {},
+      runtime: { version: SUPPORTED_OPENCLAW_VERSION, agent: makeRuntimeAgent().runtimeAgent },
+      registerTool(toolOrFactory: unknown) {
+        const tool = typeof toolOrFactory === "function" ? (toolOrFactory as Function)({ sessionKey: "agent:owner:telegram:direct:hook", agentId: "owner" }) : toolOrFactory;
+        tools.set((tool as Record<string, unknown>).name as string, tool as Record<string, unknown>);
+      },
+      registerHttpRoute() {},
+      registerHook(name: string, handler: Function) { hooks[name] = handler; },
+      registerService(service: Record<string, unknown>) { services.push(service as { start: Function; stop?: Function }); },
+    });
+    await services[0].start({ config: { gateway: { auth: { mode: "none" } } }, stateDir, logger: {} });
+
+    hooks.before_tool_call({ toolName: "workboard_create", toolCallId: "call-a", params: { title: "A" } }, { toolCallId: "call-a", sessionKey: "agent:owner:telegram:direct:hook", agentId: "owner" });
+    hooks.before_tool_call({ toolName: "workboard_create", toolCallId: "call-b", params: { title: "B" } }, { toolCallId: "call-b", sessionKey: "agent:worker:workboard-card-b", agentId: "worker" });
+    hooks.after_tool_call({ toolName: "workboard_create", toolCallId: "call-b", result: { details: { card: { id: "card-b" } } } }, { toolCallId: "call-b" });
+    hooks.after_tool_call({ toolName: "workboard_create", toolCallId: "call-a", result: { details: { card: { id: "card-a" } } } }, { toolCallId: "call-a" });
+    await flushAsyncWork();
+
+    const statusResult = await (tools.get("workboard_controller_status")!.execute as Function)();
+    const text = (statusResult.content as Array<{ text: string }>)[0].text;
+    expect(JSON.parse(text).ownerBindings).toMatchObject({ total: 1, bySource: { "core-hook": 1 } });
+    await services[0].stop?.();
   });
 });
 
