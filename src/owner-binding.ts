@@ -16,6 +16,7 @@ export function optionalSessionKey(value: unknown): string | undefined {
 
 export function isWorkboardWorkerSessionKey(sessionKey: string, cardId?: string): boolean {
   const normalized = sessionKey.toLowerCase();
+  if (normalized === "worker" || normalized.startsWith("worker:") || normalized.includes(":worker:")) return true;
   if (normalized.startsWith("subagent:") || normalized.includes(":subagent:")) return true;
   if (normalized.includes("workboard-")) return true;
   return Boolean(cardId && normalized.includes(cardId.toLowerCase()) && normalized.includes("workboard"));
@@ -26,8 +27,13 @@ export function isReliableExternalOwnerSessionKey(sessionKey: string, workerSess
   if (!normalized) return false;
   if (workerSessionKeys.includes(normalized)) return false;
   const lower = normalized.toLowerCase();
+  if (lower === "main" || lower === "cron" || lower === "dashboard" || lower === "acp") return false;
+  if (/^(?:cron|dashboard|acp)(?::|$)/.test(lower) || /:(?:cron|dashboard|acp)(?::|$)/.test(lower)) return false;
   if (/^agent:[^:]+(?::main)?$/.test(lower)) return false;
-  return !isWorkboardWorkerSessionKey(normalized, cardId);
+  if (isWorkboardWorkerSessionKey(normalized, cardId)) return false;
+  if (/^agent:[^:]+:(?:telegram|feishu|qq|dingtalk):direct:.+/.test(lower)) return true;
+  if (/^(?:telegram|feishu|qq|dingtalk):.+/.test(lower)) return true;
+  return false;
 }
 
 export function agentIdFromSessionKey(sessionKey: string): string | undefined {

@@ -1,5 +1,5 @@
 import { Type } from "typebox";
-import { buildJsonPluginConfigSchema, definePluginEntry, type OpenClawPluginDefinition } from "openclaw/plugin-sdk/plugin-entry";
+import { buildJsonPluginConfigSchema, definePluginEntry, type OpenClawPluginApi, type OpenClawPluginDefinition } from "openclaw/plugin-sdk/plugin-entry";
 import { jsonResult } from "openclaw/plugin-sdk/tool-results";
 import { configSchema as rawConfigSchema, normalizeControllerConfig, PLUGIN_DESCRIPTION, PLUGIN_ID, PLUGIN_NAME } from "./config.js";
 import { WorkboardController } from "./controller.js";
@@ -49,9 +49,10 @@ function coreCreateCorrelationKey(event: Record<string, unknown>, ctx: Record<st
   return optionalSessionKey(event.toolCallId) ?? optionalSessionKey(ctx.toolCallId);
 }
 
-function registerCoreCreateHooks(api: Record<string, unknown>): void {
-  if (typeof api.registerHook !== "function") return;
-  api.registerHook("before_tool_call", (event: unknown, ctx: unknown) => {
+type CoreToolHookApi = Pick<OpenClawPluginApi, "on">;
+
+function registerCoreCreateHooks(api: CoreToolHookApi): void {
+  api.on("before_tool_call", (event: unknown, ctx: unknown) => {
     const eventRecord = asRecord(event);
     const ctxRecord = asRecord(ctx);
     if (eventRecord.toolName !== "workboard_create") return;
@@ -61,7 +62,7 @@ function registerCoreCreateHooks(api: Record<string, unknown>): void {
     if (!isReliableExternalOwnerSessionKey(ownerSessionKey)) return;
     pendingCoreCreates.set(key, { ownerSessionKey, ownerAgentId: optionalSessionKey(ctxRecord.agentId) ?? agentIdFromSessionKey(ownerSessionKey), capturedAt: Date.now() });
   });
-  api.registerHook("after_tool_call", (event: unknown, ctx: unknown) => {
+  api.on("after_tool_call", (event: unknown, ctx: unknown) => {
     const eventRecord = asRecord(event);
     const ctxRecord = asRecord(ctx);
     if (eventRecord.toolName !== "workboard_create") return;
@@ -208,7 +209,7 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
       handler: createWorkboardCreateRouteHandler(),
     });
 
-    registerCoreCreateHooks(api as unknown as Record<string, unknown>);
+    registerCoreCreateHooks(api as unknown as CoreToolHookApi);
 
     if (api.registrationMode !== "full") return;
 

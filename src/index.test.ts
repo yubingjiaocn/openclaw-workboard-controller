@@ -19,7 +19,8 @@ import {
   WORKBOARD_LIST_ROUTE_PATH,
 } from "./workboard-gateway-shared.js";
 import type { ControllerState, StateStore } from "./state.js";
-import { emptyState } from "./state.js";
+import { createFileStateStore, emptyState } from "./state.js";
+import { isReliableExternalOwnerSessionKey } from "./owner-binding.js";
 
 class MemoryStateStore implements StateStore {
   path = "memory://state.json";
@@ -221,6 +222,7 @@ describe("plugin entry", () => {
       registerHttpRoute(route: Record<string, unknown>) {
         routes.push(route);
       },
+      on() {},
       registerService() {
         throw new Error("service should not register in tool-discovery mode");
       },
@@ -899,7 +901,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:telegram:direct:owner" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -912,11 +914,11 @@ describe("WorkboardController", () => {
     const status = await controller.runOnce("unit-test");
 
     expect(wakeRuns).toHaveLength(1);
-    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:owner", agentId: "main", trigger: "manual" });
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:telegram:direct:owner", agentId: "main", trigger: "manual" });
     expect(String(wakeRuns[0]?.prompt)).toContain("▶️ Workboard 已启动：Next Card\nID: card-2\nReason: unit-test");
     expect(String(wakeRuns[0]?.prompt)).toContain("Do not work on the card");
     expect(status.counters.startNotifications).toBe(1);
-    expect(status.recentStartNotifications).toMatchObject([{ cardId: "card-2", title: "Next Card", target: "agent:main:owner" }]);
+    expect(status.recentStartNotifications).toMatchObject([{ cardId: "card-2", title: "Next Card", target: "agent:main:telegram:direct:owner" }]);
     expect(store.state.notifiedStartIds).toEqual(["run:run-2"]);
   });
 
@@ -924,7 +926,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:telegram:direct:owner" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -940,7 +942,7 @@ describe("WorkboardController", () => {
     const status = await controller.runOnce("multi");
 
     expect(wakeRuns).toHaveLength(2);
-    expect(wakeRuns.map((run) => run.sessionKey)).toEqual(["agent:main:owner", "agent:main:owner"]);
+    expect(wakeRuns.map((run) => run.sessionKey)).toEqual(["agent:main:telegram:direct:owner", "agent:main:telegram:direct:owner"]);
     expect(wakeRuns.map((run) => String(run.prompt))).toEqual([expect.stringContaining("ID: card-a"), expect.stringContaining("ID: card-b")]);
     expect(status.counters.startNotifications).toBe(2);
   });
@@ -950,7 +952,7 @@ describe("WorkboardController", () => {
     const dispatchCalls = { count: 0 };
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:telegram:direct:owner" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -978,7 +980,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const first = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:telegram:direct:owner" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -991,7 +993,7 @@ describe("WorkboardController", () => {
     await first.runOnce("before-restart");
 
     const second = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:telegram:direct:owner" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -1012,7 +1014,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifyEnabled: false, startNotifySessionKey: "agent:main:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifyEnabled: false, startNotifySessionKey: "agent:main:telegram:direct:owner" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -1058,8 +1060,8 @@ describe("WorkboardController", () => {
           { tenant: "tenant-may", boardId: "board-a", sessionKey: "agent:may:feishu:direct:tenant" },
           { tenant: "tenant-may", boardId: "board-a", agentId: "may", sessionKey: "agent:may:feishu:direct:exact" },
         ],
-        startNotifySessionKey: "agent:main:legacy",
-        wakeFallbackSessionKey: "agent:main:fallback",
+        startNotifySessionKey: "agent:main:telegram:direct:legacy",
+        wakeFallbackSessionKey: "agent:main:telegram:direct:fallback",
       },
       started: { cardId: "card-exact", title: "Exact", sessionKey: "agent:may:workboard-card-exact", runId: "run-exact" },
       cards: [{ id: "card-exact", agentId: "may", title: "Exact", metadata: { tenant: "tenant-may" } }],
@@ -1100,14 +1102,14 @@ describe("WorkboardController", () => {
       config: {
         boardId: "board-c",
         ownerRoutes: [{ boardId: "board-a", agentId: "may", sessionKey: "agent:may:feishu:direct:exact" }],
-        startNotifySessionKey: "agent:main:legacy",
-        wakeFallbackSessionKey: "agent:main:fallback",
+        startNotifySessionKey: "agent:main:telegram:direct:legacy",
+        wakeFallbackSessionKey: "agent:main:telegram:direct:fallback",
       },
       started: { cardId: "card-legacy", title: "Legacy", sessionKey: "agent:muriel:workboard-card-legacy", runId: "run-legacy" },
       cards: [{ id: "card-legacy", agentId: "muriel", title: "Legacy" }],
     });
     expect(legacy.wakeRuns).toHaveLength(1);
-    expect(legacy.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:legacy" });
+    expect(legacy.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:telegram:direct:legacy" });
 
     const tie = await runCase({
       config: {
@@ -1133,8 +1135,8 @@ describe("WorkboardController", () => {
         boardId: "board-start",
         dispatchCooldownMs: 0,
         ownerRoutes: [{ boardId: "board-start", agentId: "may", sessionKey: "feishu:tenant-1:chat-abc" }],
-        startNotifySessionKey: "agent:main:legacy",
-        wakeFallbackSessionKey: "agent:main:fallback",
+        startNotifySessionKey: "agent:main:telegram:direct:legacy",
+        wakeFallbackSessionKey: "agent:main:telegram:direct:fallback",
       }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
@@ -1381,7 +1383,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent({ fail: true });
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:telegram:direct:owner" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -1398,7 +1400,7 @@ describe("WorkboardController", () => {
     expect(status.counters.startNotifications).toBe(0);
     expect(status.counters.startNotificationErrors).toBe(1);
     expect(status.lastError).toMatch(/embedded delivery failed/);
-    expect(status.startNotificationFailures).toMatchObject([{ cardId: "card-fail", target: "agent:main:owner", error: "embedded delivery failed" }]);
+    expect(status.startNotificationFailures).toMatchObject([{ cardId: "card-fail", target: "agent:main:telegram:direct:owner", error: "embedded delivery failed" }]);
   });
 
   it("rejects worker session keys as start notification targets", async () => {
@@ -1658,6 +1660,61 @@ describe("WorkboardController archive scan", () => {
 
 
 
+
+describe("owner session key validation", () => {
+  it("accepts direct channel owner keys and rejects shortcuts and non-direct system keys", () => {
+    for (const key of [
+      "agent:owner:telegram:direct:123",
+      "agent:owner:feishu:direct:ou_abc",
+      "agent:owner:qq:direct:qq_456",
+      "agent:owner:dingtalk:direct:ding_789",
+      "feishu:tenant-1:chat-abc",
+    ]) {
+      expect(isReliableExternalOwnerSessionKey(key)).toBe(true);
+    }
+
+    for (const key of [
+      "main",
+      "agent:owner",
+      "agent:owner:main",
+      "agent:main:owner",
+      "worker:card-a",
+      "subagent:card-a",
+      "agent:owner:workboard-card-a",
+      "cron:daily",
+      "dashboard:default",
+      "acp:session",
+      "agent:owner:telegram:group:123",
+    ]) {
+      expect(isReliableExternalOwnerSessionKey(key, [], "card-a")).toBe(false);
+    }
+  });
+});
+
+describe("file state store", () => {
+  it("serializes concurrent saves and keeps the later logical snapshot", async () => {
+    const fs = await import("node:fs/promises");
+    const stateDir = await fs.mkdtemp("/tmp/workboard-controller-state-");
+    try {
+      vi.spyOn(Date, "now").mockReturnValue(123);
+      const store = createFileStateStore(stateDir);
+      const first = emptyState();
+      first.counters.ticks = 1;
+      const second = emptyState();
+      second.counters.ticks = 2;
+      second.ownerBindings = [{ cardId: "card-later", ownerSessionKey: "agent:owner:telegram:direct:later", source: "manual", createdAt: 2 }];
+
+      await Promise.all([store.save(first), store.save(second)]);
+
+      const persisted = JSON.parse(await fs.readFile(store.path, "utf8"));
+      expect(persisted.counters.ticks).toBe(2);
+      expect(persisted.ownerBindings).toMatchObject([{ cardId: "card-later", ownerSessionKey: "agent:owner:telegram:direct:later" }]);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("owner bindings", () => {
   it("persists explicit owned create bindings only after Gateway create succeeds", async () => {
     const store = new MemoryStateStore();
@@ -1701,6 +1758,40 @@ describe("owner bindings", () => {
 
     await expect(controller.createOwnedCard({ title: "Nope" }, "agent:owner:telegram:direct:123")).rejects.toThrow(/create denied/);
     expect(store.state.ownerBindings).toEqual([]);
+  });
+
+  it("does not hijack an existing binding when owned create returns an idempotent card", async () => {
+    const store = new MemoryStateStore();
+    store.state.ownerBindings = [{ cardId: "card-owned", ownerSessionKey: "agent:other:telegram:direct:999", ownerAgentId: "other", source: "manual", createdAt: 1 }];
+    const { runtimeAgent } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ enabled: false }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: { async request() { return { card: { id: "card-owned", title: "Owned" } }; } },
+    });
+
+    await expect(controller.createOwnedCard({ title: "Owned", idempotencyKey: "same" }, "agent:owner:telegram:direct:123", "owner")).rejects.toThrow(/already bound to another owner/);
+    expect(store.state.ownerBindings).toEqual([{ cardId: "card-owned", ownerSessionKey: "agent:other:telegram:direct:999", ownerAgentId: "other", source: "manual", createdAt: 1 }]);
+  });
+
+  it("leaves an existing same-owner binding unchanged for idempotent owned create", async () => {
+    const store = new MemoryStateStore();
+    store.state.ownerBindings = [{ cardId: "card-owned", ownerSessionKey: "agent:owner:telegram:direct:123", ownerAgentId: "owner", source: "manual", createdAt: 1 }];
+    const { runtimeAgent } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ enabled: false }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: { async request() { return { card: { id: "card-owned", title: "Owned" } }; } },
+    });
+
+    await expect(controller.createOwnedCard({ title: "Owned", idempotencyKey: "same" }, "agent:owner:telegram:direct:123", "owner")).resolves.toEqual({ card: { id: "card-owned", title: "Owned" } });
+    expect(store.state.ownerBindings).toEqual([{ cardId: "card-owned", ownerSessionKey: "agent:owner:telegram:direct:123", ownerAgentId: "owner", source: "manual", createdAt: 1 }]);
   });
 
   it("prefers durable binding over ownerRoutes for terminal wakes and start notifications", async () => {
@@ -1786,9 +1877,10 @@ describe("owner bindings", () => {
         tools.set((tool as Record<string, unknown>).name as string, tool as Record<string, unknown>);
       },
       registerHttpRoute() {},
-      registerHook(name: string, handler: Function) { hooks[name] = handler; },
+      on(name: string, handler: Function) { hooks[name] = handler; },
       registerService(service: Record<string, unknown>) { services.push(service as { start: Function; stop?: Function }); },
     });
+    expect(Object.keys(hooks).sort()).toEqual(["after_tool_call", "before_tool_call"]);
     await services[0].start({ config: { gateway: { auth: { mode: "none" } } }, stateDir, logger: {} });
 
     hooks.before_tool_call({ toolName: "workboard_create", toolCallId: "call-a", params: { title: "A" } }, { toolCallId: "call-a", sessionKey: "agent:owner:telegram:direct:hook", agentId: "owner" });

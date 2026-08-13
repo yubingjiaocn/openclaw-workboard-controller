@@ -40,6 +40,7 @@ plugin.register({
   runtime: { version: "validator", agent: {} },
   registerTool() {},
   registerHttpRoute(route) { httpRoutes.push(route); },
+  on() {},
   registerService(service) { services.push(service); },
 });
 for (const routePath of [

@@ -389,6 +389,16 @@ function normalizeState(raw: unknown): ControllerState {
 export function createFileStateStore(stateDir: string): StateStore {
   const dataDir = path.join(stateDir, "workboard-controller");
   const filePath = path.join(dataDir, "state.json");
+  let saveTail: Promise<void> = Promise.resolve();
+  let saveSequence = 0;
+
+  async function writeSnapshot(snapshot: string, sequence: number): Promise<void> {
+    await mkdir(dataDir, { recursive: true });
+    const tmpPath = `${filePath}.${process.pid}.${sequence}.tmp`;
+    await writeFile(tmpPath, snapshot, "utf8");
+    await rename(tmpPath, filePath);
+  }
+
   return {
     path: filePath,
     async load() {
@@ -400,10 +410,11 @@ export function createFileStateStore(stateDir: string): StateStore {
       }
     },
     async save(state) {
-      await mkdir(dataDir, { recursive: true });
-      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-      await writeFile(tmpPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-      await rename(tmpPath, filePath);
+      const snapshot = `${JSON.stringify(state, null, 2)}\n`;
+      const sequence = ++saveSequence;
+      const write = saveTail.catch(() => undefined).then(() => writeSnapshot(snapshot, sequence));
+      saveTail = write;
+      await write;
     },
   };
 }

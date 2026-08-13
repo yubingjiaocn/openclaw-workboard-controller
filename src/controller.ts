@@ -235,6 +235,12 @@ export class WorkboardController {
     const state = await this.requireState();
     const now = Date.now();
     const existing = state.ownerBindings.find((binding) => binding.cardId === cardId);
+    if (existing && input.source !== "manual") {
+      if (existing.ownerSessionKey !== ownerSessionKey) {
+        throw new Error(`card ${cardId} is already bound to another owner session`);
+      }
+      return existing;
+    }
     const binding: OwnerBinding = {
       cardId,
       ownerSessionKey,
