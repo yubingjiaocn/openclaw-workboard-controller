@@ -1,8 +1,8 @@
 {
   "id": "workboard-controller",
   "name": "Workboard Controller",
-  "description": "Automatically dispatches Workboard ready cards after terminal events, wakes owner sessions for terminal results, and notifies owners when cards start.",
-  "version": "0.6.0",
+  "description": "Reconciles Workboard cards, dispatches ready work, wakes owner sessions for terminal results, and notifies owners when cards start.",
+  "version": "0.7.0",
   "activation": {
     "onStartup": true,
     "onConfigPaths": [
@@ -65,6 +65,10 @@
       "dispatchCooldownMs": {
         "type": "number",
         "description": "Minimum delay between dispatch calls. Default 2000."
+      },
+      "reconcileIntervalMs": {
+        "type": "number",
+        "description": "Periodic Workboard dispatch/reconciliation interval in milliseconds. This lets Workboard reclaim expired claims and block timed-out running cards even when no terminal notification was emitted. Set 0 to disable. Default 60000."
       },
       "dispatchTimeoutMs": {
         "type": "number",

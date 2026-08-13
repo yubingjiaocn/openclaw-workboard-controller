@@ -1,13 +1,13 @@
 # Workboard Controller
 
 Local-only OpenClaw plugin that closes the first Workboard automation gap:
-when Workboard emits terminal notifications, the controller wakes the original owner session for terminal result processing, dispatches the next ready cards, and sends separate concise start notifications for newly started cards. Completed, failed, stale, dispatch-blocked, and worker start-failure terminal outcomes all use owner-session wakes. It can also scan for safely archived done cards, disabled and dry-run by default.
+The controller periodically runs Workboard's public dispatch/reconciliation path, wakes the original owner session for terminal result processing, dispatches ready cards, and sends separate concise start notifications for newly started cards. Periodic reconciliation lets Workboard reclaim expired claims and block timed-out running attempts even when a worker dies without calling complete/block. Completed, failed, stale, dispatch-blocked, and worker start-failure terminal outcomes all use owner-session wakes. It can also scan for safely archived done cards, disabled and dry-run by default.
 
 ## Design
 
 - Watches Workboard durable notifications through the public `workboard_notify_events` tool without advancing the cursor first.
 - Persists only controller state under the OpenClaw plugin state dir: subscription id, processed event ids, delivered terminal wake ids, a bounded pending terminal inbox, durable card-level owner bindings, legacy problem ids, notified start identities, bounded recent terminal wakes/failures, bounded start notifications/failures, counters, and last error. It does not persist Gateway credentials.
-- Event order is explicit: read a contiguous batch, persist each terminal event into the durable pending inbox by wake identity/resolved owner route, dispatch ready cards once when the batch had new terminal events, advance the Workboard subscription cursor with `workboard_notify_advance`, and deliver due owner wake batches independently.
+- Event order is explicit: read a contiguous batch, persist each terminal event into the durable pending inbox by wake identity/resolved owner route, run Workboard dispatch immediately for new terminal events or periodically when `reconcileIntervalMs` is due, advance the Workboard subscription cursor with `workboard_notify_advance`, and deliver due owner wake batches independently.
 - Calls Gateway-authenticated plugin self-routes for `workboard.cards.dispatch` and `workboard.cards.create`. Owned create never writes Workboard SQLite directly; it uses the official `workboard.cards.create` Gateway method, then persists the sidecar owner binding only after card creation succeeds.
 - Wakes owners for terminal outcomes `completed`, `failed`, `stale`, dispatch `blocked`, and worker `startFailure` via the official session routing/delivery surface available to plugins. On OpenClaw 2026.7.1-2 this is `api.runtime.agent.runEmbeddedAgent` with the target `sessionKey` preserved exactly. Terminal events are coalesced per owner using `terminalWakeDebounceMs`, a non-sliding window anchored at the first pending event for that owner. Later events join the batch without moving the deadline. Completed wakes ask the owner agent to review the terminal result, update the user only if useful, and handle follow-up without duplicating dispatch or redoing completed work. Failed/stale/blocked/startFailure wakes ask the owner agent to inspect, explain, repair or retry when safe, use Workboard recovery actions as appropriate, and not bypass retry limits.
 - Scope boundary: the controller does not inspect worktrees or files, reserve paths, detect parallel workers writing the same file, or provide file-conflict isolation. That remains owner task-decomposition responsibility. The controller only coalesces terminal/start events, isolates owner wake state, and keeps dispatch idempotent.
@@ -65,6 +65,8 @@ Required config changes are left to the main agent/operator. At minimum, enable 
         config: {
           boardId: "default",
           pollIntervalMs: 15000,
+          // Run Workboard reconciliation once per minute even if no terminal event arrives.
+          reconcileIntervalMs: 60000,
           gatewayToolSessionKey: "main",
           terminalWakeEnabled: true,
           terminalWakeDebounceMs: 1000,
@@ -103,7 +105,7 @@ Gateway restart is required after changing plugin config.
 ## Tools
 
 - `workboard_controller_status`: returns controller status, durable state path, counters including queued terminal events (`terminalEventsQueued`), successful delivered terminal events (`terminalWakes`/legacy `wakes`), batched owner wake runs (`terminalWakeBatches`), terminal wake errors (`terminalWakeErrors`/legacy `wakeErrors`), last error, bounded `pendingTerminalEvents` per-owner counts, bounded owner binding counts/summary without session-key contents, `inFlightOwnerWakes`, bounded `recentTerminalWakes`, bounded `terminalWakeFailures`, bounded `recentStartNotifications`, bounded `startNotificationFailures`, legacy `wakeFailures`, archive config summary, bounded `archiveCandidates`, and bounded `archiveLastFailures`.
-- `workboard_controller_tick`: runs one notification/dispatch pass manually. It runs an archive scan only if `archiveEnabled=true` and `archiveScanIntervalMs` is due.
+- `workboard_controller_tick`: runs one notification pass and a Workboard dispatch/reconciliation pass when `reconcileIntervalMs` is due. It runs an archive scan only if `archiveEnabled=true` and `archiveScanIntervalMs` is due.
 - `workboard_create_owned`: optional create wrapper with the practical `workboard_create` inputs plus `ownerSessionKey`. If `ownerSessionKey` is omitted, the tool uses the trusted plugin tool context `sessionKey`; it never derives owner identity from user-supplied `agentId`.
 - `workboard_owner_bind`: optional repair tool for existing cards. It requires `cardId` and accepts `ownerSessionKey`, defaulting to trusted current session when omitted. Worker/subagent/workboard session keys are rejected.
 
@@ -115,6 +117,6 @@ Both tools are optional and exist for local verification/debugging. The controll
 
 - The controller does not auto-clear or archive Goals.
 - Terminal wake and start notification delivery prefer the official direct session-delivery API when OpenClaw exposes one to plugins. OpenClaw 2026.7.1-2 does not expose a stable plugin API for direct visible message delivery to an existing session, so the controller uses `api.runtime.agent.runEmbeddedAgent`. Terminal wake prompts are owner-agent processing turns; start notification prompts are constrained to notification delivery only. The embedded run uses the configured target `sessionKey` and therefore the target session's existing delivery context. If the target session has no usable delivery route, the event is still recorded in that session but may not produce an external chat notification.
-- The controller relies on Workboard notification events; if a card is manually moved to `blocked` without a Workboard `failed`/`stale` notification or dispatch result, it is not detected by this first version.
+- Periodic reconciliation intentionally delegates stale-running detection to Workboard core rather than probing private session state. On OpenClaw 2026.7.1-2, core dispatch blocks attempts that exceed `maxRuntimeSeconds` and reclaims claims only after `expiresAt` plus Workboard's 5-minute grace period. Manual status mutations that emit neither a notification nor a dispatch result remain outside the controller's detection surface.
 - Version gate is intentionally strict because the Workboard notification tools, Gateway-authenticated route scope, `workboard.cards.create`, and `workboard.cards.dispatch` envelopes are version-sensitive. OpenClaw 2026.7.1-2 does not preserve unknown Workboard card metadata, so owner bindings live in controller-owned plugin state. Best-effort hooks auto-capture ordinary `workboard_create` calls only when hook context includes a trusted non-worker `sessionKey` and a stable `toolCallId`.
 - Runtime `configSchema` is wrapped with `buildJsonPluginConfigSchema`; there is one TypeScript-only cast at that wrapper call because TypeBox objects lack the index signature expected by OpenClaw 2026.7.1-2 `JsonSchemaObject` types.

@@ -220,6 +220,11 @@ describe("config", () => {
     ]);
     expect(() => normalizeControllerConfig({ ownerRoutes: [{ sessionKey: "agent:main:telegram:direct:1" }] })).toThrow(/at least one/);
   });
+
+  it("enables periodic Workboard reconciliation by default and permits disabling it", () => {
+    expect(normalizeControllerConfig({}).reconcileIntervalMs).toBe(60_000);
+    expect(normalizeControllerConfig({ reconcileIntervalMs: 0 }).reconcileIntervalMs).toBe(0);
+  });
 });
 
 describe("plugin entry", () => {
@@ -371,6 +376,80 @@ describe("Workboard dispatch self-route", () => {
   });
 
 describe("WorkboardController", () => {
+  it("periodically dispatches without a terminal event so Workboard can reconcile stale running cards", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const dispatchCalls = { count: 0 };
+    const { runtimeAgent } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        dispatchCooldownMs: 0,
+        reconcileIntervalMs: 60_000,
+        startNotifyEnabled: false,
+        terminalWakeEnabled: false,
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({ eventBatches: [[], [], []], dispatchCalls }),
+    });
+
+    await controller.runOnce("startup");
+    expect(dispatchCalls.count).toBe(1);
+    expect(controller.status().reconciliation).toEqual({ enabled: true, intervalMs: 60_000, nextAt: 60_000 });
+
+    vi.setSystemTime(59_999);
+    await controller.runOnce("early");
+    expect(dispatchCalls.count).toBe(1);
+
+    vi.setSystemTime(60_000);
+    await controller.runOnce("due");
+    expect(dispatchCalls.count).toBe(2);
+  });
+
+  it("turns a reconciliation-blocked card into the existing owner terminal-wake path", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "default",
+        dispatchCooldownMs: 0,
+        reconcileIntervalMs: 60_000,
+        terminalWakeDebounceMs: 0,
+        startNotifyEnabled: false,
+        ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:watchdog-owner" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[]],
+        blocked: [{
+          id: "stale-running-card",
+          boardId: "default",
+          agentId: "main",
+          title: "Stale Running Card",
+          status: "blocked",
+          updatedAt: 70_000,
+          metadata: { claim: undefined, failureCount: 1 },
+        }],
+      }),
+    });
+
+    await controller.runOnce("watchdog");
+    await flushAsyncWork();
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:telegram:direct:watchdog-owner", agentId: "main" });
+    expect(String(wakeRuns[0].prompt)).toContain("eventKind: blocked");
+    expect(String(wakeRuns[0].prompt)).toContain("cardId: stale-running-card");
+    expect(store.state.pendingTerminalEvents).toEqual([]);
+    expect(store.state.terminalWakeIds[0]).toMatch(/^blocked:stale-running-card:/);
+  });
+
   it("dispatches after completed notification and advances after durable processing", async () => {
     const calls: Array<{ method: string; params?: unknown }> = [];
     const store = new MemoryStateStore();

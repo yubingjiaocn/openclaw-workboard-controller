@@ -135,6 +135,11 @@ export type ControllerStatus = {
     bySource: Record<string, number>;
     recent: Array<{ cardId: string; source: string; ownerAgentId?: string; createdAt: number; updatedAt?: number; inheritedFromCardId?: string }>;
   };
+  reconciliation: {
+    enabled: boolean;
+    intervalMs: number;
+    nextAt?: number;
+  };
   archive: {
     enabled: boolean;
     dryRun: boolean;
@@ -216,6 +221,13 @@ export class WorkboardController {
       inFlightOwnerWakes: Array.from(this.inFlightOwnerWakes.values()).map((wake) => ({ ...wake, wakeKeys: [...wake.wakeKeys] })),
       wakeFailures: state?.wakeFailures ?? [],
       ownerBindings: ownerBindingsStatus(state?.ownerBindings ?? []),
+      reconciliation: {
+        enabled: this.options.config.reconcileIntervalMs > 0,
+        intervalMs: this.options.config.reconcileIntervalMs,
+        nextAt: state?.lastDispatchAt === undefined || this.options.config.reconcileIntervalMs === 0
+          ? undefined
+          : state.lastDispatchAt + this.options.config.reconcileIntervalMs,
+      },
       archive: {
         enabled: this.options.config.archiveEnabled,
         dryRun: this.options.config.archiveDryRun,
@@ -278,7 +290,9 @@ export class WorkboardController {
       await this.ensureSubscription();
       const batch = await this.processNotificationBatch();
       await this.processDueTerminalWakes();
-      if (batch.newEvents > 0) await this.dispatchReadyCards(reason);
+      if (batch.newEvents > 0 || this.isReconciliationDue(Date.now())) {
+        await this.dispatchReadyCards(batch.newEvents > 0 ? reason : `reconcile:${reason}`);
+      }
       await this.processDueTerminalWakes();
       if (batch.advanceCount > 0) await this.advanceNotifications(batch.advanceCount);
       const archiveOk = await this.runArchiveScanIfDue();
@@ -430,6 +444,12 @@ export class WorkboardController {
       runId: event.runId,
       event,
     });
+  }
+
+  private isReconciliationDue(now: number): boolean {
+    if (this.options.config.reconcileIntervalMs <= 0) return false;
+    const lastDispatchAt = this.state?.lastDispatchAt;
+    return lastDispatchAt === undefined || now - lastDispatchAt >= this.options.config.reconcileIntervalMs;
   }
 
   private async dispatchReadyCards(reason: string): Promise<void> {

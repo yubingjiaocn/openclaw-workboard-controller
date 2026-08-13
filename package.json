@@ -1,9 +1,9 @@
 {
   "name": "openclaw-plugin-workboard-controller",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "private": true,
-  "description": "Local Workboard controller for OpenClaw terminal owner wakes, dispatch, start notifications, and archive planning.",
+  "description": "Local Workboard controller for periodic reconciliation, terminal owner wakes, dispatch, start notifications, and archive planning.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "plugin:validate": "npm run build && node ./scripts/validate-plugin.mjs",

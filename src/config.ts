@@ -8,6 +8,7 @@ export const SUPPORTED_OPENCLAW_VERSION = "2026.7.1-2";
 const DEFAULT_POLL_INTERVAL_MS = 15_000;
 const DEFAULT_LIMIT = 50;
 const DEFAULT_DISPATCH_COOLDOWN_MS = 2_000;
+const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
 const DEFAULT_WAKE_TIMEOUT_MS = 120_000;
 const DEFAULT_TERMINAL_WAKE_DEBOUNCE_MS = 1_000;
 const DEFAULT_DISPATCH_TIMEOUT_MS = 60_000;
@@ -34,6 +35,7 @@ export const configSchema = Type.Object(
     pollIntervalMs: Type.Optional(Type.Number({ description: "Notification poll interval in milliseconds. Default 15000." })),
     batchLimit: Type.Optional(Type.Number({ description: "Maximum Workboard notifications to process per tick. Default 50." })),
     dispatchCooldownMs: Type.Optional(Type.Number({ description: "Minimum delay between dispatch calls. Default 2000." })),
+    reconcileIntervalMs: Type.Optional(Type.Number({ description: "Periodic Workboard dispatch/reconciliation interval in milliseconds. This lets Workboard reclaim expired claims and block timed-out running cards even when no terminal notification was emitted. Set 0 to disable. Default 60000." })),
     dispatchTimeoutMs: Type.Optional(Type.Number({ description: "Gateway self-route timeout for Workboard dispatch in milliseconds. Default 60000." })),
     gatewayBaseUrl: Type.Optional(Type.String({ description: "Optional Gateway HTTP base URL for /tools/invoke and the controller self-route. Default http://127.0.0.1:${OPENCLAW_GATEWAY_PORT || gateway.port || 18789}." })),
     gatewayToolSessionKey: Type.Optional(Type.String({ description: "Session key passed to /tools/invoke for Workboard notification tool policy routing. Default main." })),
@@ -74,6 +76,7 @@ export type ControllerConfig = {
   pollIntervalMs: number;
   batchLimit: number;
   dispatchCooldownMs: number;
+  reconcileIntervalMs: number;
   dispatchTimeoutMs: number;
   gatewayBaseUrl?: string;
   gatewayToolSessionKey: string;
@@ -155,6 +158,7 @@ export function normalizeControllerConfig(raw: unknown): ControllerConfig {
     pollIntervalMs: optionalNumber(record, "pollIntervalMs", DEFAULT_POLL_INTERVAL_MS, 1_000, 300_000),
     batchLimit: optionalNumber(record, "batchLimit", DEFAULT_LIMIT, 1, 200),
     dispatchCooldownMs: optionalNumber(record, "dispatchCooldownMs", DEFAULT_DISPATCH_COOLDOWN_MS, 0, 300_000),
+    reconcileIntervalMs: optionalNumber(record, "reconcileIntervalMs", DEFAULT_RECONCILE_INTERVAL_MS, 0, 3_600_000),
     dispatchTimeoutMs: optionalNumber(record, "dispatchTimeoutMs", DEFAULT_DISPATCH_TIMEOUT_MS, 1_000, 600_000),
     gatewayBaseUrl: optionalString(record, "gatewayBaseUrl"),
     gatewayToolSessionKey: optionalString(record, "gatewayToolSessionKey") ?? "main",
