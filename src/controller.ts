@@ -57,6 +57,10 @@ type WorkboardListPayload = {
   cards: WorkboardCard[];
 };
 
+type WorkboardReadPayload = {
+  card?: WorkboardCard;
+};
+
 type ArchivePayload = {
   card: WorkboardCard;
 };
@@ -653,7 +657,7 @@ export class WorkboardController {
     const input = pendingEventWakeInput(event);
     const contextResult = await this.resolveProblemCardContext(input);
     const card = contextResult.card ?? input.card;
-    if (card && !event.card) event.card = serializableRecord(card);
+    if (card && (!event.card || !isIdentifiedCard(event.card as WorkboardCard))) event.card = serializableRecord(card);
     if (!event.cardId && card?.id) event.cardId = card.id;
     if (!event.title) event.title = terminalWakeTitle(input, card);
     const target = await this.resolveTerminalWakeTarget(input, card);
@@ -816,7 +820,7 @@ export class WorkboardController {
   }
 
   private async resolveProblemCardContext(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard; event?: WorkboardNotification }): Promise<{ card?: WorkboardCard; lookupError?: string }> {
-    if (input.card) return { card: input.card };
+    if (input.card && isIdentifiedCard(input.card)) return { card: input.card };
     const cardId = optionalSessionKey(input.cardId);
     const runId = optionalSessionKey(input.runId);
     const sessionKey = optionalSessionKey(input.sessionKey);
@@ -832,7 +836,18 @@ export class WorkboardController {
         if (sessionKey && (candidate.sessionKey === sessionKey || candidate.execution?.sessionKey === sessionKey)) return true;
         return false;
       });
-      if (!card && notificationId) card = uniqueNotificationCardMatch(cards, notificationId, input.event?.sequence);
+      if (!card && notificationId) {
+        const fullCards: WorkboardCard[] = [];
+        for (const candidate of cards) {
+          const candidateId = optionalSessionKey(candidate.id);
+          if (!candidateId) continue;
+          const readPayload = await this.options.gateway.request<WorkboardReadPayload | WorkboardCard>("workboard.cards.read", { id: candidateId });
+          const fullCard = isIdentifiedCard(readPayload as WorkboardCard) ? readPayload as WorkboardCard : (readPayload as WorkboardReadPayload).card;
+          if (!fullCard) throw new Error(`workboard.cards.read returned no card for ${candidateId}`);
+          fullCards.push(fullCard);
+        }
+        card = uniqueNotificationCardMatch(fullCards, notificationId, input.event?.sequence);
+      }
       if (card) await this.findOrInheritOwnerBinding(card.id, card, cardsById);
       return { card };
     } catch (error) {
@@ -967,6 +982,16 @@ function serializableRecord(value: unknown): Record<string, unknown> | undefined
   return asRecord(value);
 }
 
+function isIdentifiedCard(card: WorkboardCard): boolean {
+  return Boolean(
+    optionalSessionKey(card.id)
+      ?? optionalSessionKey(card.runId)
+      ?? optionalSessionKey(card.execution?.runId)
+      ?? optionalSessionKey(card.sessionKey)
+      ?? optionalSessionKey(card.execution?.sessionKey),
+  );
+}
+
 function pendingEventWakeInput(event: PendingTerminalEvent): {
   wakeKey: string;
   kind: TerminalWakeKind;
@@ -1054,8 +1079,7 @@ function cardHasNotification(card: WorkboardCard, notificationId: string, sequen
   const entries = cardNotificationEntries(card).filter((entry) => entry.id === notificationId);
   if (!entries.length) return false;
   if (typeof sequence !== "number" || !Number.isFinite(sequence)) return true;
-  if (entries.some((entry) => entry.sequence === sequence)) return true;
-  return !entries.some((entry) => entry.sequence !== undefined);
+  return entries.some((entry) => entry.sequence === sequence);
 }
 
 function cardNotificationEntries(card: WorkboardCard): Array<{ id?: string; sequence?: number }> {

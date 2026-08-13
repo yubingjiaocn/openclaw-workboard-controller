@@ -142,16 +142,20 @@ type StartNotificationGatewayOptions = {
   startFailures?: Array<Record<string, unknown>>;
   blocked?: Array<Record<string, unknown>>;
   cards?: Array<Record<string, unknown>>;
+  readCards?: Array<Record<string, unknown>>;
   listError?: Error;
+  readErrorIds?: Set<string>;
   methods?: string[];
+  requests?: Array<{ method: string; params?: unknown }>;
   dispatchCalls?: { count: number };
 };
 
 function startNotificationGateway(options: StartNotificationGatewayOptions) {
   let eventBatchIndex = 0;
   return {
-    async request(method: string) {
+    async request(method: string, params?: unknown) {
       options.methods?.push(method);
+      options.requests?.push({ method, params: structuredClone(params) });
       if (method === "workboard.notifications.subscribe") return { subscription: { id: "sub-start" } };
       if (method === "workboard.notifications.events") {
         const batches = options.eventBatches ?? [[completedEvent("evt-start")]];
@@ -165,6 +169,13 @@ function startNotificationGateway(options: StartNotificationGatewayOptions) {
       if (method === "workboard.cards.list") {
         if (options.listError) throw options.listError;
         return { cards: structuredClone(options.cards ?? []) };
+      }
+      if (method === "workboard.cards.read") {
+        const id = (params as { id?: string } | undefined)?.id;
+        if (!id) throw new Error("missing card read id");
+        if (options.readErrorIds?.has(id)) throw new Error(`read failed for ${id}`);
+        const card = (options.readCards ?? options.cards ?? []).find((entry) => entry.id === id);
+        return { card: structuredClone(card) };
       }
       return {};
     },
@@ -832,7 +843,7 @@ describe("WorkboardController", () => {
     expect(store.state.terminalWakeIds).toEqual(["event:evt-pending-restart"]);
   });
 
-  it("resolves a production-shape pending notification from card metadata on retry and prefers durable binding", async () => {
+  it("resolves a persisted pending notification with empty card from compact list plus full card reads", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1000);
     const store = new MemoryStateStore();
@@ -843,10 +854,12 @@ describe("WorkboardController", () => {
       message: "done",
       firstObservedAt: 0,
       event: { id: "a87bab10-prod", kind: "completed", createdAt: 1, message: "done", sequence: 714 },
+      card: {},
       attemptCount: 1,
       lastError: "could not resolve a reliable owner route; configure ownerRoutes with the original owner sessionKey",
     }];
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const requests: Array<{ method: string; params?: unknown }> = [];
     const controller = new WorkboardController({
       config: normalizeControllerConfig({
         boardId: "default",
@@ -860,7 +873,12 @@ describe("WorkboardController", () => {
       runtimeAgent,
       gateway: startNotificationGateway({
         eventBatches: [[]],
+        requests,
         cards: [
+          { id: "wrong-sequence-card", title: "Wrong", status: "done", priority: "normal", agentId: "worker", boardId: "default", parents: [], children: [], updatedAt: 1 },
+          { id: "31fee4f7-card", title: "Real", status: "done", priority: "normal", agentId: "worker", boardId: "default", parents: [], children: [], updatedAt: 1 },
+        ],
+        readCards: [
           { id: "wrong-sequence-card", boardId: "default", title: "Wrong", metadata: { notifications: [{ id: "a87bab10-prod", sequence: 713 }] } },
           { id: "31fee4f7-card", boardId: "default", title: "Real", metadata: { notifications: [{ id: "a87bab10-prod", sequence: 714 }] } },
         ],
@@ -875,6 +893,46 @@ describe("WorkboardController", () => {
     expect(String(wakeRuns[0].prompt)).toContain("cardId: 31fee4f7-card");
     expect(store.state.pendingTerminalEvents).toEqual([]);
     expect(store.state.terminalWakeIds).toEqual(["event:a87bab10-prod"]);
+    expect(requests.filter((request) => request.method === "workboard.cards.read").map((request) => request.params)).toEqual([
+      { id: "wrong-sequence-card" },
+      { id: "31fee4f7-card" },
+    ]);
+  });
+
+  it("does not read or replace an already identified direct card", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const requests: Array<{ method: string; params?: unknown }> = [];
+    store.state.pendingTerminalEvents = [{
+      wakeKey: "event:direct-card",
+      kind: "completed",
+      message: "done",
+      firstObservedAt: 0,
+      card: { id: "direct-card", boardId: "default", title: "Direct", metadata: { notifications: [{ id: "evt-direct", sequence: 1 }] } },
+      event: { id: "evt-direct", kind: "completed", createdAt: 1, message: "done", sequence: 1 },
+      attemptCount: 0,
+    }];
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ boardId: "default", dispatchCooldownMs: 0, terminalWakeDebounceMs: 0, ownerRoutes: [{ boardId: "default", sessionKey: "agent:main:telegram:direct:owner" }] }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[]],
+        requests,
+      }),
+    });
+
+    await controller.runOnce("direct-card");
+    await flushAsyncWork();
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(String(wakeRuns[0].prompt)).toContain("cardId: direct-card");
+    expect(requests.map((request) => request.method)).not.toContain("workboard.cards.list");
+    expect(requests.map((request) => request.method)).not.toContain("workboard.cards.read");
   });
 
   it("leaves ambiguous and unmatched metadata notification events pending without guessing", async () => {
@@ -899,9 +957,14 @@ describe("WorkboardController", () => {
           { id: "evt-no-match", kind: "completed", createdAt: 2, message: "missing", sequence: 100 },
         ], []],
         cards: [
+          { id: "ambiguous-a", title: "A", status: "done", priority: "normal", agentId: "worker", boardId: "default", parents: [], children: [], updatedAt: 1 },
+          { id: "ambiguous-b", title: "B", status: "done", priority: "normal", agentId: "worker", boardId: "default", parents: [], children: [], updatedAt: 1 },
+          { id: "sequence-mismatch", title: "C", status: "done", priority: "normal", agentId: "worker", boardId: "default", parents: [], children: [], updatedAt: 1 },
+        ],
+        readCards: [
           { id: "ambiguous-a", boardId: "default", title: "A", metadata: { notifications: [{ id: "evt-ambiguous", sequence: 42 }] } },
           { id: "ambiguous-b", boardId: "default", title: "B", metadata: { notifications: [{ id: "evt-ambiguous", sequence: 42 }] } },
-          { id: "sequence-mismatch", boardId: "default", title: "C", metadata: { notifications: [{ id: "evt-no-match", sequence: 99 }] } },
+          { id: "sequence-mismatch", boardId: "default", title: "C", metadata: { notifications: [{ id: "evt-no-match", sequence: 99 }, { id: "evt-no-match" }] } },
         ],
       }),
     });
@@ -917,6 +980,58 @@ describe("WorkboardController", () => {
     ]);
     expect(store.state.terminalWakeFailures.map((failure) => failure.wakeKey)).toEqual(["event:evt-ambiguous", "event:evt-no-match"]);
     expect(store.state.terminalWakeIds).toEqual([]);
+  });
+
+  it("leaves notification lookup pending when any full card read fails", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    store.state.ownerBindings = [{ cardId: "real-card", ownerSessionKey: "agent:main:telegram:direct:owner", ownerAgentId: "main", source: "manual", createdAt: 1 }];
+    store.state.pendingTerminalEvents = [{
+      wakeKey: "event:evt-read-failure",
+      kind: "completed",
+      message: "done",
+      firstObservedAt: 0,
+      event: { id: "evt-read-failure", kind: "completed", createdAt: 1, message: "done", sequence: 7 },
+      card: {},
+      attemptCount: 0,
+    }];
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const requests: Array<{ method: string; params?: unknown }> = [];
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ boardId: "default", dispatchCooldownMs: 0, terminalWakeDebounceMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[]],
+        requests,
+        cards: [
+          { id: "real-card", title: "Real", status: "done", priority: "normal", agentId: "worker", boardId: "default", parents: [], children: [], updatedAt: 1 },
+          { id: "unreadable-card", title: "Unreadable", status: "done", priority: "normal", agentId: "worker", boardId: "default", parents: [], children: [], updatedAt: 1 },
+        ],
+        readCards: [
+          { id: "real-card", boardId: "default", title: "Real", metadata: { notifications: [{ id: "evt-read-failure", sequence: 7 }] } },
+        ],
+        readErrorIds: new Set(["unreadable-card"]),
+      }),
+    });
+
+    await controller.runOnce("read-failure");
+    await flushAsyncWork();
+
+    expect(wakeRuns).toEqual([]);
+    expect(store.state.pendingTerminalEvents).toHaveLength(1);
+    expect(store.state.pendingTerminalEvents[0]).toMatchObject({ wakeKey: "event:evt-read-failure", attemptCount: 1 });
+    expect(store.state.pendingTerminalEvents[0]).not.toHaveProperty("cardId");
+    expect(store.state.pendingTerminalEvents[0]).not.toHaveProperty("ownerSessionKey");
+    expect(store.state.pendingTerminalEvents[0].lastError).toContain("could not resolve owner route after workboard.cards.list failed: read failed for unreadable-card");
+    expect(store.state.terminalWakeIds).toEqual([]);
+    expect(requests.filter((request) => request.method === "workboard.cards.read").map((request) => request.params)).toEqual([
+      { id: "real-card" },
+      { id: "unreadable-card" },
+    ]);
   });
 
   it("retains pending terminal events after wake failure for later retry", async () => {
@@ -1991,7 +2106,7 @@ describe("GatewayMethodClient", () => {
     await expect(dispatchGatewayMethod("workboard.cards.dispatch", {})).rejects.toThrow(/reserved for plugin HTTP routes/);
   });
 
-  it("invokes Workboard notification tools over /tools/invoke with gateway auth and parses result.details", async () => {
+  it("invokes Workboard notification and card-read tools over /tools/invoke with gateway auth and parses result.details", async () => {
     const captured: CapturedRequest[] = [];
 
     await withToolInvokeServer(
@@ -2005,7 +2120,9 @@ describe("GatewayMethodClient", () => {
               ? { subscription: { id: "sub-http" }, events: [{ id: "evt-http", kind: "completed", createdAt: 1, message: "done" }] }
               : tool === "workboard_notify_advance"
                 ? { subscription: { id: "sub-http", lastEventId: "evt-http" }, events: [{ id: "evt-http", kind: "completed", createdAt: 1, message: "done" }] }
-                : { unexpectedTool: tool };
+                : tool === "workboard_read"
+                  ? { card: { id: body.args.id, metadata: { notifications: [{ id: "evt-http", sequence: 1 }] } } }
+                  : { unexpectedTool: tool };
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, result: { content: [{ type: "text", text: JSON.stringify(details) }], details } }));
       },
@@ -2025,15 +2142,22 @@ describe("GatewayMethodClient", () => {
           subscription: { id: "sub-http", lastEventId: "evt-http" },
           events: [{ id: "evt-http", kind: "completed", createdAt: 1, message: "done" }],
         });
+        await expect(client.request("workboard.cards.read", { id: "card-http" })).resolves.toEqual({
+          card: { id: "card-http", metadata: { notifications: [{ id: "evt-http", sequence: 1 }] } },
+        });
       },
     );
 
-    expect(captured.map((request) => request.url)).toEqual(["/tools/invoke", "/tools/invoke", "/tools/invoke"]);
-    expect(captured.map((request) => request.headers.authorization)).toEqual(["Bearer env-token", "Bearer env-token", "Bearer env-token"]);
-    expect(captured.map((request) => request.body.tool)).toEqual(["workboard_notify_subscribe", "workboard_notify_events", "workboard_notify_advance"]);
+    expect(captured.map((request) => request.url)).toEqual(["/tools/invoke", "/tools/invoke", "/tools/invoke", "/tools/invoke"]);
+    expect(captured.map((request) => request.headers.authorization)).toEqual(["Bearer env-token", "Bearer env-token", "Bearer env-token", "Bearer env-token"]);
+    expect(captured.map((request) => request.body.tool)).toEqual(["workboard_notify_subscribe", "workboard_notify_events", "workboard_notify_advance", "workboard_read"]);
     expect(captured.map((request) => request.body.tool)).not.toContain("workboard_dispatch");
     expect(captured[0].body).toMatchObject({
       args: { boardId: "default", target: "controller" },
+      sessionKey: "main",
+    });
+    expect(captured[3].body).toMatchObject({
+      args: { id: "card-http" },
       sessionKey: "main",
     });
   });
@@ -2120,9 +2244,10 @@ describe("GatewayMethodClient", () => {
 
   it("parses JSON text content when tool result details are absent", async () => {
     await withToolInvokeServer(
-      (_req, res) => {
+      (_req, res, body) => {
+        const text = body.tool === "workboard_read" ? '{"card":{"id":"card-json"}}' : '{"events":[]}';
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, result: { content: [{ type: "text", text: '{"events":[]}' }] } }));
+        res.end(JSON.stringify({ ok: true, result: { content: [{ type: "text", text }] } }));
       },
       async (baseUrl) => {
         const client = createGatewayMethodClient({
@@ -2132,6 +2257,7 @@ describe("GatewayMethodClient", () => {
           sessionKey: "agent:main",
         });
         await expect(client.request("workboard.notifications.events", {})).resolves.toEqual({ events: [] });
+        await expect(client.request("workboard.cards.read", { id: "card-json" })).resolves.toEqual({ card: { id: "card-json" } });
       },
     );
   });

@@ -45,6 +45,7 @@ const METHOD_TO_TOOL: Record<string, string> = {
   "workboard.notifications.subscribe": "workboard_notify_subscribe",
   "workboard.notifications.events": "workboard_notify_events",
   "workboard.notifications.advance": "workboard_notify_advance",
+  "workboard.cards.read": "workboard_read",
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
