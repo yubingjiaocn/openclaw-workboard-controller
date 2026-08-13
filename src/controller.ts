@@ -815,22 +815,24 @@ export class WorkboardController {
     return agentIdFromSessionKey(sessionKey) ?? context.agentId ?? this.options.config.wakeFallbackAgentId;
   }
 
-  private async resolveProblemCardContext(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard }): Promise<{ card?: WorkboardCard; lookupError?: string }> {
+  private async resolveProblemCardContext(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard; event?: WorkboardNotification }): Promise<{ card?: WorkboardCard; lookupError?: string }> {
     if (input.card) return { card: input.card };
     const cardId = optionalSessionKey(input.cardId);
     const runId = optionalSessionKey(input.runId);
     const sessionKey = optionalSessionKey(input.sessionKey);
-    if (!cardId && !runId && !sessionKey) return {};
+    const notificationId = optionalSessionKey(input.event?.id);
+    if (!cardId && !runId && !sessionKey && !notificationId) return {};
     try {
       const payload = await this.options.gateway.request<WorkboardListPayload>("workboard.cards.list", { boardId: this.options.config.boardId });
       const cards = payload.cards ?? [];
       const cardsById = new Map(cards.map((entry) => [entry.id, entry]));
-      const card = cards.find((candidate) => {
+      let card = cards.find((candidate) => {
         if (cardId && candidate.id === cardId) return true;
         if (runId && (candidate.runId === runId || candidate.execution?.runId === runId)) return true;
         if (sessionKey && (candidate.sessionKey === sessionKey || candidate.execution?.sessionKey === sessionKey)) return true;
         return false;
       });
+      if (!card && notificationId) card = uniqueNotificationCardMatch(cards, notificationId, input.event?.sequence);
       if (card) await this.findOrInheritOwnerBinding(card.id, card, cardsById);
       return { card };
     } catch (error) {
@@ -1041,6 +1043,32 @@ function pendingTerminalEventsStatus(events: PendingTerminalEvent[], debounceMs:
 
 function terminalWakeTitle(input: { cardId?: string; card?: WorkboardCard; event?: WorkboardNotification }, card?: WorkboardCard): string | undefined {
   return optionalSessionKey(card?.title) ?? optionalSessionKey(input.card?.title) ?? optionalSessionKey(input.cardId) ?? optionalSessionKey(card?.id) ?? optionalSessionKey(input.event?.cardId);
+}
+
+function uniqueNotificationCardMatch(cards: WorkboardCard[], notificationId: string, sequence?: number): WorkboardCard | undefined {
+  const matches = cards.filter((card) => cardHasNotification(card, notificationId, sequence));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function cardHasNotification(card: WorkboardCard, notificationId: string, sequence?: number): boolean {
+  const entries = cardNotificationEntries(card).filter((entry) => entry.id === notificationId);
+  if (!entries.length) return false;
+  if (typeof sequence !== "number" || !Number.isFinite(sequence)) return true;
+  if (entries.some((entry) => entry.sequence === sequence)) return true;
+  return !entries.some((entry) => entry.sequence !== undefined);
+}
+
+function cardNotificationEntries(card: WorkboardCard): Array<{ id?: string; sequence?: number }> {
+  const metadata = asRecord(card.metadata);
+  const notifications = metadata.notifications;
+  if (!Array.isArray(notifications)) return [];
+  return notifications.flatMap((entry) => {
+    const record = asRecord(entry);
+    const id = optionalSessionKey(record.id);
+    if (!id) return [];
+    const sequence = typeof record.sequence === "number" && Number.isFinite(record.sequence) ? record.sequence : undefined;
+    return [{ id, sequence }];
+  });
 }
 
 function buildTerminalWakeBatchPrompt(events: PendingTerminalEvent[]): string {

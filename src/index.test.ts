@@ -532,6 +532,7 @@ describe("WorkboardController", () => {
     expect(methods).toEqual([
       "workboard.notifications.subscribe",
       "workboard.notifications.events",
+      "workboard.cards.list",
       "workboard.cards.dispatch",
       "workboard.notifications.advance",
     ]);
@@ -829,6 +830,93 @@ describe("WorkboardController", () => {
     expect(wakeRuns).toHaveLength(1);
     expect(status.pendingTerminalEvents.total).toBe(0);
     expect(store.state.terminalWakeIds).toEqual(["event:evt-pending-restart"]);
+  });
+
+  it("resolves a production-shape pending notification from card metadata on retry and prefers durable binding", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+    const store = new MemoryStateStore();
+    store.state.ownerBindings = [{ cardId: "31fee4f7-card", ownerSessionKey: "agent:main:telegram:direct:8068735520", ownerAgentId: "main", source: "manual", createdAt: 1 }];
+    store.state.pendingTerminalEvents = [{
+      wakeKey: "event:a87bab10-prod",
+      kind: "completed",
+      message: "done",
+      firstObservedAt: 0,
+      event: { id: "a87bab10-prod", kind: "completed", createdAt: 1, message: "done", sequence: 714 },
+      attemptCount: 1,
+      lastError: "could not resolve a reliable owner route; configure ownerRoutes with the original owner sessionKey",
+    }];
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "default",
+        dispatchCooldownMs: 0,
+        terminalWakeDebounceMs: 0,
+        ownerRoutes: [{ boardId: "default", sessionKey: "agent:route:telegram:direct:wrong" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[]],
+        cards: [
+          { id: "wrong-sequence-card", boardId: "default", title: "Wrong", metadata: { notifications: [{ id: "a87bab10-prod", sequence: 713 }] } },
+          { id: "31fee4f7-card", boardId: "default", title: "Real", metadata: { notifications: [{ id: "a87bab10-prod", sequence: 714 }] } },
+        ],
+      }),
+    });
+
+    await controller.runOnce("retry-production-shape");
+    await flushAsyncWork();
+
+    expect(wakeRuns).toHaveLength(1);
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:telegram:direct:8068735520", agentId: "main" });
+    expect(String(wakeRuns[0].prompt)).toContain("cardId: 31fee4f7-card");
+    expect(store.state.pendingTerminalEvents).toEqual([]);
+    expect(store.state.terminalWakeIds).toEqual(["event:a87bab10-prod"]);
+  });
+
+  it("leaves ambiguous and unmatched metadata notification events pending without guessing", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = new MemoryStateStore();
+    store.state.ownerBindings = [
+      { cardId: "ambiguous-a", ownerSessionKey: "agent:a:telegram:direct:1", ownerAgentId: "a", source: "manual", createdAt: 1 },
+      { cardId: "ambiguous-b", ownerSessionKey: "agent:b:telegram:direct:2", ownerAgentId: "b", source: "manual", createdAt: 1 },
+      { cardId: "sequence-mismatch", ownerSessionKey: "agent:c:telegram:direct:3", ownerAgentId: "c", source: "manual", createdAt: 1 },
+    ];
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ boardId: "default", dispatchCooldownMs: 0, terminalWakeDebounceMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[
+          { id: "evt-ambiguous", kind: "completed", createdAt: 1, message: "ambiguous", sequence: 42 },
+          { id: "evt-no-match", kind: "completed", createdAt: 2, message: "missing", sequence: 100 },
+        ], []],
+        cards: [
+          { id: "ambiguous-a", boardId: "default", title: "A", metadata: { notifications: [{ id: "evt-ambiguous", sequence: 42 }] } },
+          { id: "ambiguous-b", boardId: "default", title: "B", metadata: { notifications: [{ id: "evt-ambiguous", sequence: 42 }] } },
+          { id: "sequence-mismatch", boardId: "default", title: "C", metadata: { notifications: [{ id: "evt-no-match", sequence: 99 }] } },
+        ],
+      }),
+    });
+
+    await controller.runOnce("ambiguous-no-match");
+    await flushAsyncWork();
+
+    expect(wakeRuns).toEqual([]);
+    expect(store.state.pendingTerminalEvents).toHaveLength(2);
+    expect(store.state.pendingTerminalEvents).toMatchObject([
+      { wakeKey: "event:evt-ambiguous", cardId: undefined, ownerSessionKey: undefined, attemptCount: 1 },
+      { wakeKey: "event:evt-no-match", cardId: undefined, ownerSessionKey: undefined, attemptCount: 1 },
+    ]);
+    expect(store.state.terminalWakeFailures.map((failure) => failure.wakeKey)).toEqual(["event:evt-ambiguous", "event:evt-no-match"]);
+    expect(store.state.terminalWakeIds).toEqual([]);
   });
 
   it("retains pending terminal events after wake failure for later retry", async () => {
