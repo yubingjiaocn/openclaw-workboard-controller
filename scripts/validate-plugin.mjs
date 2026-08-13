@@ -72,6 +72,7 @@ for (const key of [
   "dispatchCooldownMs",
   "gatewayBaseUrl",
   "gatewayToolSessionKey",
+  "ownerRoutes",
   "startNotifyEnabled",
   "startNotifySessionKey",
   "wakeEnabled",

@@ -14,6 +14,16 @@ const DEFAULT_ARCHIVE_COMPLETED_GRAPH_AFTER_MS = 86_400_000;
 const DEFAULT_ARCHIVE_STANDALONE_AFTER_MS = 604_800_000;
 const DEFAULT_ARCHIVE_SCAN_INTERVAL_MS = 3_600_000;
 
+const ownerRouteSchema = Type.Object(
+  {
+    sessionKey: Type.String({ description: "Full direct owner/routing session key. Preserve the channel-specific key exactly; do not use agent shortcuts." }),
+    tenant: Type.Optional(Type.String({ description: "Optional tenant match from public Workboard card metadata." })),
+    boardId: Type.Optional(Type.String({ description: "Optional Workboard board id match." })),
+    agentId: Type.Optional(Type.String({ description: "Optional Workboard card agent id match." })),
+  },
+  { additionalProperties: false },
+);
+
 export const configSchema = Type.Object(
   {
     enabled: Type.Optional(Type.Boolean({ description: "Start the controller service on Gateway startup. Default true." })),
@@ -26,6 +36,7 @@ export const configSchema = Type.Object(
     dispatchTimeoutMs: Type.Optional(Type.Number({ description: "Gateway self-route timeout for Workboard dispatch in milliseconds. Default 60000." })),
     gatewayBaseUrl: Type.Optional(Type.String({ description: "Optional Gateway HTTP base URL for /tools/invoke and the controller self-route. Default http://127.0.0.1:${OPENCLAW_GATEWAY_PORT || gateway.port || 18789}." })),
     gatewayToolSessionKey: Type.Optional(Type.String({ description: "Session key passed to /tools/invoke for Workboard notification tool policy routing. Default main." })),
+    ownerRoutes: Type.Optional(Type.Array(ownerRouteSchema, { description: "Channel-agnostic owner routing table. Each entry must include sessionKey and at least one of tenant, boardId, or agentId. More matching dimensions wins; equal specificity uses declaration order." })),
     startNotifyEnabled: Type.Optional(Type.Boolean({ description: "Notify the owner/routing session when dispatch starts Workboard cards. Default true." })),
     startNotifySessionKey: Type.Optional(Type.String({ description: "Explicit session key that receives Workboard card start notifications." })),
     wakeEnabled: Type.Optional(Type.Boolean({ description: "Wake owner sessions on failed/stale/blocked events. Default true." })),
@@ -45,6 +56,13 @@ export const configSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export type OwnerRoute = {
+  sessionKey: string;
+  tenant?: string;
+  boardId?: string;
+  agentId?: string;
+};
+
 export type ControllerConfig = {
   enabled: boolean;
   boardId: string;
@@ -56,6 +74,7 @@ export type ControllerConfig = {
   dispatchTimeoutMs: number;
   gatewayBaseUrl?: string;
   gatewayToolSessionKey: string;
+  ownerRoutes: OwnerRoute[];
   startNotifyEnabled: boolean;
   startNotifySessionKey?: string;
   wakeEnabled: boolean;
@@ -89,6 +108,27 @@ function optionalStringArray(record: Record<string, unknown>, key: string): stri
   return items.length ? Array.from(new Set(items)) : undefined;
 }
 
+function normalizeOwnerRoutes(record: Record<string, unknown>): OwnerRoute[] {
+  const value = record.ownerRoutes;
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("ownerRoutes must be an array");
+  return value.map((entry, index) => {
+    const route = asRecord(entry);
+    const sessionKey = optionalString(route, "sessionKey");
+    if (!sessionKey) throw new Error(`ownerRoutes[${index}].sessionKey must be a non-empty string`);
+    const normalized: OwnerRoute = {
+      sessionKey,
+      tenant: optionalString(route, "tenant"),
+      boardId: optionalString(route, "boardId"),
+      agentId: optionalString(route, "agentId"),
+    };
+    if (!normalized.tenant && !normalized.boardId && !normalized.agentId) {
+      throw new Error(`ownerRoutes[${index}] must include at least one of tenant, boardId, or agentId`);
+    }
+    return normalized;
+  });
+}
+
 function optionalNumber(record: Record<string, unknown>, key: string, fallback: number, min: number, max: number): number {
   const value = record[key];
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -113,6 +153,7 @@ export function normalizeControllerConfig(raw: unknown): ControllerConfig {
     dispatchTimeoutMs: optionalNumber(record, "dispatchTimeoutMs", DEFAULT_DISPATCH_TIMEOUT_MS, 1_000, 600_000),
     gatewayBaseUrl: optionalString(record, "gatewayBaseUrl"),
     gatewayToolSessionKey: optionalString(record, "gatewayToolSessionKey") ?? "main",
+    ownerRoutes: normalizeOwnerRoutes(record),
     startNotifyEnabled: optionalBoolean(record, "startNotifyEnabled", true),
     startNotifySessionKey: optionalString(record, "startNotifySessionKey"),
     wakeEnabled: optionalBoolean(record, "wakeEnabled", true),

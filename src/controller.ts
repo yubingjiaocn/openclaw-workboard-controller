@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { computeArchiveCandidates, type WorkboardArchiveCard } from "./archive.js";
-import type { ControllerConfig } from "./config.js";
+import type { ControllerConfig, OwnerRoute } from "./config.js";
 import { assertCompatibleOpenClawVersion } from "./config.js";
 import type { GatewayMethodClient } from "./gateway-method-client.js";
 import { errorMessage } from "./gateway-method-client.js";
-import type { ArchiveFailure, ControllerState, StartNotificationFailure, StateStore } from "./state.js";
+import type { ArchiveFailure, ControllerState, StartNotificationFailure, StateStore, WakeFailure } from "./state.js";
 import { rememberBounded } from "./state.js";
 
 type Logger = {
@@ -23,11 +23,14 @@ type WorkboardNotification = {
   createdAt: number;
   sequence?: number;
   message: string;
+  cardId?: string;
   sessionKey?: string;
   runId?: string;
 };
 
 type WorkboardCard = WorkboardArchiveCard & {
+  boardId?: string;
+  tenant?: string;
   agentId?: string;
   sessionKey?: string;
   runId?: string;
@@ -69,6 +72,17 @@ type DispatchPayload = {
   startFailures?: Array<{ cardId?: string; error?: string; card?: WorkboardCard }>;
 };
 
+type OwnerRouteContext = {
+  tenant?: string;
+  boardId?: string;
+  agentId?: string;
+};
+
+type OwnerTargetResolution =
+  | { status: "target"; sessionKey: string; agentId: string; source: "ownerRoutes" | "legacy-startNotifySessionKey" | "legacy-wakeFallbackSessionKey" }
+  | { status: "rejected"; error: string; target?: string }
+  | { status: "none" };
+
 export type ControllerStatus = {
   running: boolean;
   enabled: boolean;
@@ -83,6 +97,7 @@ export type ControllerStatus = {
   archiveLastFailures: ControllerState["archiveLastFailures"];
   recentStartNotifications: ControllerState["recentStartNotifications"];
   startNotificationFailures: ControllerState["startNotificationFailures"];
+  wakeFailures: ControllerState["wakeFailures"];
   archive: {
     enabled: boolean;
     dryRun: boolean;
@@ -151,11 +166,12 @@ export class WorkboardController {
       lastDispatchAt: state?.lastDispatchAt,
       lastArchiveScanAt: state?.lastArchiveScanAt,
       lastError: state?.lastError,
-      counters: state?.counters ?? { ticks: 0, events: 0, dispatches: 0, wakes: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
+      counters: state?.counters ?? { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
       archiveCandidates: state?.archiveCandidates ?? [],
       archiveLastFailures: state?.archiveLastFailures ?? [],
       recentStartNotifications: state?.recentStartNotifications ?? [],
       startNotificationFailures: state?.startNotificationFailures ?? [],
+      wakeFailures: state?.wakeFailures ?? [],
       archive: {
         enabled: this.options.config.archiveEnabled,
         dryRun: this.options.config.archiveDryRun,
@@ -322,6 +338,7 @@ export class WorkboardController {
       problemKey: `${event.kind}:${event.id}`,
       kind: event.kind,
       message: event.message,
+      cardId: event.cardId,
       sessionKey: event.sessionKey,
       runId: event.runId,
     });
@@ -353,6 +370,7 @@ export class WorkboardController {
         problemKey: `start-failure:${failure.cardId ?? failure.card?.id ?? randomUUID()}:${failure.error ?? "unknown"}`,
         kind: "failed",
         message: `Workboard worker start failed: ${failure.error ?? "unknown error"}`,
+        cardId: failure.cardId ?? failure.card?.id,
         card: failure.card,
       });
     }
@@ -367,7 +385,7 @@ export class WorkboardController {
 
     let cardsById = new Map<string, WorkboardCard>();
     let listError: string | undefined;
-    if (!this.options.config.startNotifySessionKey) {
+    if (this.options.config.ownerRoutes.length) {
       try {
         const payload = await this.options.gateway.request<WorkboardListPayload>("workboard.cards.list", { boardId: this.options.config.boardId });
         cardsById = new Map((payload.cards ?? []).map((card) => [card.id, card]));
@@ -383,22 +401,23 @@ export class WorkboardController {
       const listedCard = cardsById.get(cardId);
       const title = startedCardTitle(entry.card, listedCard);
       const target = this.resolveStartNotificationTarget(entry.card, listedCard);
-      if (!target) {
-        const error = listError
-          ? `could not resolve owner session after workboard.cards.list failed: ${listError}`
-          : "could not resolve a reliable external owner session; configure startNotifySessionKey or wakeFallbackSessionKey";
-        await this.recordStartNotificationFailure({ cardId, title, error, at: Date.now() });
+      if (target.status !== "target") {
+        const error = target.status === "rejected"
+          ? target.error
+          : listError
+            ? `could not resolve owner route after workboard.cards.list failed: ${listError}`
+            : "could not resolve a reliable owner route; configure ownerRoutes, startNotifySessionKey, or wakeFallbackSessionKey";
+        await this.recordStartNotificationFailure({ cardId, title, target: target.status === "rejected" ? target.target : undefined, error, at: Date.now() });
         continue;
       }
 
       try {
-        const agentId = agentIdFromSessionKey(target.sessionKey) ?? listedCard?.agentId ?? this.options.config.wakeFallbackAgentId;
-        const workspaceDir = this.options.runtimeAgent.resolveAgentWorkspaceDir(this.options.fullConfig, agentId);
+        const workspaceDir = this.options.runtimeAgent.resolveAgentWorkspaceDir(this.options.fullConfig, target.agentId);
         const timeoutMs = this.options.config.wakeTimeoutMs || this.options.runtimeAgent.resolveAgentTimeoutMs({ cfg: this.options.fullConfig });
         await this.options.runtimeAgent.runEmbeddedAgent({
           sessionId: randomUUID(),
           sessionKey: target.sessionKey,
-          agentId,
+          agentId: target.agentId,
           workspaceDir,
           config: this.options.fullConfig,
           prompt: buildStartNotificationPrompt({ cardId, title, reason }),
@@ -418,18 +437,28 @@ export class WorkboardController {
     }
   }
 
-  private resolveStartNotificationTarget(started: StartedWorkboardCard, card?: WorkboardCard): { sessionKey: string } | undefined {
+  private resolveStartNotificationTarget(started: StartedWorkboardCard, card?: WorkboardCard): OwnerTargetResolution {
     const cardId = startedCardId(started) ?? card?.id;
-    const workerSessionKey = optionalSessionKey(started.sessionKey) ?? optionalSessionKey(card?.execution?.sessionKey) ?? optionalSessionKey(card?.sessionKey);
-    const explicit = optionalSessionKey(this.options.config.startNotifySessionKey);
-    if (explicit) return isReliableExternalOwnerSessionKey(explicit, workerSessionKey, cardId) ? { sessionKey: explicit } : undefined;
+    const context = this.ownerRouteContext({ started, card });
+    const routeTarget = this.resolveConfiguredOwnerRoute(context, workerSessionKeys({ started, card }), cardId);
+    if (routeTarget.status !== "none") return routeTarget;
 
-    const ownerSessionKey = resolveOwnerSessionKeyFromCard(card, workerSessionKey, cardId);
-    if (ownerSessionKey) return { sessionKey: ownerSessionKey };
+    const explicit = optionalSessionKey(this.options.config.startNotifySessionKey);
+    if (explicit) {
+      if (isReliableExternalOwnerSessionKey(explicit, workerSessionKeys({ started, card }), cardId)) {
+        return { status: "target", sessionKey: explicit, agentId: this.targetAgentId(explicit, context), source: "legacy-startNotifySessionKey" };
+      }
+      return { status: "rejected", target: explicit, error: `legacy startNotifySessionKey target rejected as a worker session: ${explicit}` };
+    }
 
     const fallback = optionalSessionKey(this.options.config.wakeFallbackSessionKey);
-    if (fallback && isReliableExternalOwnerSessionKey(fallback, workerSessionKey, cardId)) return { sessionKey: fallback };
-    return undefined;
+    if (fallback) {
+      if (isReliableExternalOwnerSessionKey(fallback, workerSessionKeys({ started, card }), cardId)) {
+        return { status: "target", sessionKey: fallback, agentId: this.targetAgentId(fallback, context), source: "legacy-wakeFallbackSessionKey" };
+      }
+      return { status: "rejected", target: fallback, error: `legacy wakeFallbackSessionKey target rejected as a worker session: ${fallback}` };
+    }
+    return { status: "none" };
   }
 
   private async recordStartNotificationFailure(failure: StartNotificationFailure): Promise<void> {
@@ -445,6 +474,7 @@ export class WorkboardController {
     problemKey: string;
     kind: "failed" | "stale" | "blocked";
     message: string;
+    cardId?: string;
     sessionKey?: string;
     runId?: string;
     card?: WorkboardCard;
@@ -452,27 +482,118 @@ export class WorkboardController {
     const state = await this.requireState();
     if (!this.options.config.wakeEnabled) return;
     if (state.notifiedProblemIds.includes(input.problemKey)) return;
-    const sessionKey = input.sessionKey ?? input.card?.sessionKey ?? input.card?.execution?.sessionKey ?? this.options.config.wakeFallbackSessionKey;
-    const agentId = input.card?.agentId ?? this.options.config.wakeFallbackAgentId;
-    const workspaceDir = this.options.runtimeAgent.resolveAgentWorkspaceDir(this.options.fullConfig, agentId);
+
+    const contextResult = await this.resolveProblemCardContext(input);
+    const card = contextResult.card;
+    const cardId = input.cardId ?? card?.id;
+    const target = this.resolveProblemWakeTarget(input, card);
+    if (target.status !== "target") {
+      const error = target.status === "rejected"
+        ? target.error
+        : contextResult.lookupError
+          ? `could not resolve owner route after workboard.cards.list failed: ${contextResult.lookupError}`
+          : "could not resolve a reliable owner route; configure ownerRoutes or wakeFallbackSessionKey";
+      await this.recordWakeFailure({ problemKey: input.problemKey, kind: input.kind, cardId, target: target.status === "rejected" ? target.target : undefined, error, at: Date.now() });
+      return;
+    }
+
+    const workspaceDir = this.options.runtimeAgent.resolveAgentWorkspaceDir(this.options.fullConfig, target.agentId);
     const timeoutMs = this.options.config.wakeTimeoutMs || this.options.runtimeAgent.resolveAgentTimeoutMs({ cfg: this.options.fullConfig });
-    const prompt = buildWakePrompt(input);
-    await this.options.runtimeAgent.runEmbeddedAgent({
-      // sessionId is a transcript identifier, not a routing sessionKey.
-      sessionId: randomUUID(),
-      sessionKey,
-      agentId,
-      workspaceDir,
-      config: this.options.fullConfig,
-      prompt,
-      trigger: "manual",
-      runId: randomUUID(),
-      timeoutMs,
-      ...(this.options.config.wakeToolsAllow ? { toolsAllow: this.options.config.wakeToolsAllow } : {}),
+    const prompt = buildWakePrompt({ ...input, card });
+    try {
+      await this.options.runtimeAgent.runEmbeddedAgent({
+        // sessionId is a transcript identifier, not a routing sessionKey.
+        sessionId: randomUUID(),
+        sessionKey: target.sessionKey,
+        agentId: target.agentId,
+        workspaceDir,
+        config: this.options.fullConfig,
+        prompt,
+        trigger: "manual",
+        runId: randomUUID(),
+        timeoutMs,
+        ...(this.options.config.wakeToolsAllow ? { toolsAllow: this.options.config.wakeToolsAllow } : {}),
+      });
+      state.notifiedProblemIds = rememberBounded(state.notifiedProblemIds, input.problemKey);
+      state.counters.wakes += 1;
+      if (state.lastError?.startsWith("problem wake failed")) state.lastError = undefined;
+      await this.save();
+    } catch (error) {
+      await this.recordWakeFailure({ problemKey: input.problemKey, kind: input.kind, cardId, target: target.sessionKey, error: errorMessage(error), at: Date.now() });
+    }
+  }
+
+  private resolveProblemWakeTarget(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard }, card?: WorkboardCard): OwnerTargetResolution {
+    const cardId = input.cardId ?? card?.id ?? input.card?.id;
+    const context = this.ownerRouteContext({ card: card ?? input.card });
+    const eventSessionKey = optionalSessionKey(input.sessionKey);
+    const workerKeys = workerSessionKeys({
+      card: card ?? input.card,
+      extra: eventSessionKey && isWorkboardWorkerSessionKey(eventSessionKey, cardId) ? [eventSessionKey] : [],
     });
-    state.notifiedProblemIds = rememberBounded(state.notifiedProblemIds, input.problemKey);
-    state.counters.wakes += 1;
+    const routeTarget = this.resolveConfiguredOwnerRoute(context, workerKeys, cardId);
+    if (routeTarget.status !== "none") return routeTarget;
+
+    const fallback = optionalSessionKey(this.options.config.wakeFallbackSessionKey);
+    if (fallback) {
+      if (isReliableExternalOwnerSessionKey(fallback, workerKeys, cardId)) {
+        return { status: "target", sessionKey: fallback, agentId: this.targetAgentId(fallback, context), source: "legacy-wakeFallbackSessionKey" };
+      }
+      return { status: "rejected", target: fallback, error: `legacy wakeFallbackSessionKey target rejected as a worker session: ${fallback}` };
+    }
+    return { status: "none" };
+  }
+
+  private resolveConfiguredOwnerRoute(context: OwnerRouteContext, workerKeys: string[], cardId?: string): OwnerTargetResolution {
+    const route = selectOwnerRoute(this.options.config.ownerRoutes, context);
+    if (!route) return { status: "none" };
+    if (!isReliableExternalOwnerSessionKey(route.sessionKey, workerKeys, cardId)) {
+      return { status: "rejected", target: route.sessionKey, error: `ownerRoutes target rejected as a worker session: ${route.sessionKey}` };
+    }
+    return { status: "target", sessionKey: route.sessionKey, agentId: this.targetAgentId(route.sessionKey, context), source: "ownerRoutes" };
+  }
+
+  private ownerRouteContext(input: { started?: StartedWorkboardCard; card?: WorkboardCard }): OwnerRouteContext {
+    return {
+      tenant: tenantFromCard(input.card) ?? tenantFromCard(input.started),
+      boardId: cardBoardId(input.card) ?? cardBoardId(input.started) ?? this.options.config.boardId,
+      agentId: optionalSessionKey(input.started?.agentId) ?? optionalSessionKey(input.card?.agentId),
+    };
+  }
+
+  private targetAgentId(sessionKey: string, context: OwnerRouteContext): string {
+    return agentIdFromSessionKey(sessionKey) ?? context.agentId ?? this.options.config.wakeFallbackAgentId;
+  }
+
+  private async resolveProblemCardContext(input: { cardId?: string; sessionKey?: string; runId?: string; card?: WorkboardCard }): Promise<{ card?: WorkboardCard; lookupError?: string }> {
+    if (input.card) return { card: input.card };
+    const cardId = optionalSessionKey(input.cardId);
+    const runId = optionalSessionKey(input.runId);
+    const sessionKey = optionalSessionKey(input.sessionKey);
+    if (!cardId && !runId && !sessionKey) return {};
+    try {
+      const payload = await this.options.gateway.request<WorkboardListPayload>("workboard.cards.list", { boardId: this.options.config.boardId });
+      const cards = payload.cards ?? [];
+      const card = cards.find((candidate) => {
+        if (cardId && candidate.id === cardId) return true;
+        if (runId && (candidate.runId === runId || candidate.execution?.runId === runId)) return true;
+        if (sessionKey && (candidate.sessionKey === sessionKey || candidate.execution?.sessionKey === sessionKey)) return true;
+        return false;
+      });
+      return { card };
+    } catch (error) {
+      return { lookupError: errorMessage(error) };
+    }
+  }
+
+  private async recordWakeFailure(failure: WakeFailure): Promise<void> {
+    const state = await this.requireState();
+    state.wakeFailures = [...state.wakeFailures, failure].slice(-50);
+    state.notifiedProblemIds = rememberBounded(state.notifiedProblemIds, failure.problemKey);
+    state.lastError = `problem wake failed${failure.cardId ? ` for ${failure.cardId}` : ""}: ${failure.error}`;
+    state.counters.wakeErrors += 1;
     await this.save();
+    this.options.logger?.warn?.("workboard-controller problem wake failed", failure);
   }
 }
 
@@ -502,6 +623,59 @@ function startNotificationIdentity(card: StartedWorkboardCard, dispatchAt: numbe
   return `card:${cardId}:${Math.trunc(startedAt)}`;
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function cardBoardId(card: unknown): string | undefined {
+  return optionalSessionKey(asRecord(card).boardId);
+}
+
+function tenantFromCard(card: unknown): string | undefined {
+  const record = asRecord(card);
+  const metadata = asRecord(record.metadata);
+  return optionalSessionKey(record.tenant) ?? optionalSessionKey(metadata.tenant) ?? optionalSessionKey(metadata.tenantId);
+}
+
+function workerSessionKeys(input: { started?: StartedWorkboardCard; card?: WorkboardCard; extra?: unknown[] }): string[] {
+  const values = [
+    input.started?.sessionKey,
+    input.started?.execution?.sessionKey,
+    input.card?.sessionKey,
+    input.card?.execution?.sessionKey,
+    ...(input.extra ?? []),
+  ];
+  return Array.from(new Set(values.flatMap((value) => {
+    const sessionKey = optionalSessionKey(value);
+    return sessionKey ? [sessionKey] : [];
+  })));
+}
+
+function routeSpecificity(route: OwnerRoute): number {
+  return [route.tenant, route.boardId, route.agentId].filter(Boolean).length;
+}
+
+function routeMatches(route: OwnerRoute, context: OwnerRouteContext): boolean {
+  if (route.tenant && route.tenant !== context.tenant) return false;
+  if (route.boardId && route.boardId !== context.boardId) return false;
+  if (route.agentId && route.agentId !== context.agentId) return false;
+  return true;
+}
+
+function selectOwnerRoute(routes: OwnerRoute[], context: OwnerRouteContext): OwnerRoute | undefined {
+  let selected: OwnerRoute | undefined;
+  let selectedSpecificity = 0;
+  for (const route of routes) {
+    if (!routeMatches(route, context)) continue;
+    const specificity = routeSpecificity(route);
+    if (specificity > selectedSpecificity) {
+      selected = route;
+      selectedSpecificity = specificity;
+    }
+  }
+  return selected;
+}
+
 function isWorkboardWorkerSessionKey(sessionKey: string, cardId?: string): boolean {
   const normalized = sessionKey.toLowerCase();
   if (normalized.startsWith("subagent:") || normalized.includes(":subagent:")) return true;
@@ -509,20 +683,11 @@ function isWorkboardWorkerSessionKey(sessionKey: string, cardId?: string): boole
   return Boolean(cardId && normalized.includes(cardId.toLowerCase()) && normalized.includes("workboard"));
 }
 
-function isReliableExternalOwnerSessionKey(sessionKey: string, workerSessionKey?: string, cardId?: string): boolean {
+function isReliableExternalOwnerSessionKey(sessionKey: string, workerSessionKeys: string[] = [], cardId?: string): boolean {
   const normalized = optionalSessionKey(sessionKey);
   if (!normalized) return false;
-  if (workerSessionKey && normalized === workerSessionKey) return false;
+  if (workerSessionKeys.includes(normalized)) return false;
   return !isWorkboardWorkerSessionKey(normalized, cardId);
-}
-
-function resolveOwnerSessionKeyFromCard(card: WorkboardCard | undefined, workerSessionKey?: string, cardId?: string): string | undefined {
-  if (!card) return undefined;
-  const candidates = [
-    optionalSessionKey(card.sessionKey),
-    ...(card.events ?? []).map((event) => optionalSessionKey(event.sessionKey)).reverse(),
-  ];
-  return candidates.find((candidate): candidate is string => Boolean(candidate && isReliableExternalOwnerSessionKey(candidate, workerSessionKey, cardId)));
 }
 
 function agentIdFromSessionKey(sessionKey: string): string | undefined {

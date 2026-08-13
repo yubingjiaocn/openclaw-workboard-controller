@@ -128,6 +128,7 @@ function completedEvent(id: string): Record<string, unknown> {
 type StartNotificationGatewayOptions = {
   eventBatches?: Array<Array<Record<string, unknown>>>;
   started?: Array<Record<string, unknown>>;
+  startFailures?: Array<Record<string, unknown>>;
   cards?: Array<Record<string, unknown>>;
   listError?: Error;
   methods?: string[];
@@ -147,7 +148,7 @@ function startNotificationGateway(options: StartNotificationGatewayOptions) {
       if (method === "workboard.notifications.advance") return {};
       if (method === "workboard.cards.dispatch") {
         if (options.dispatchCalls) options.dispatchCalls.count += 1;
-        return { started: structuredClone(options.started ?? []), startFailures: [] };
+        return { started: structuredClone(options.started ?? []), startFailures: structuredClone(options.startFailures ?? []) };
       }
       if (method === "workboard.cards.list") {
         if (options.listError) throw options.listError;
@@ -188,6 +189,13 @@ describe("config", () => {
     expect(config.compatibleOpenClawVersions).toEqual([SUPPORTED_OPENCLAW_VERSION]);
     expect(() => assertCompatibleOpenClawVersion(config, SUPPORTED_OPENCLAW_VERSION)).not.toThrow();
     expect(() => assertCompatibleOpenClawVersion(config, "2026.8.1")).toThrow(/version-gated/);
+  });
+
+  it("normalizes ownerRoutes and rejects entries without match dimensions", () => {
+    expect(normalizeControllerConfig({ ownerRoutes: [{ boardId: " default ", sessionKey: " agent:main:telegram:direct:1 " }] }).ownerRoutes).toEqual([
+      { boardId: "default", sessionKey: "agent:main:telegram:direct:1", tenant: undefined, agentId: undefined },
+    ]);
+    expect(() => normalizeControllerConfig({ ownerRoutes: [{ sessionKey: "agent:main:telegram:direct:1" }] })).toThrow(/at least one/);
   });
 });
 
@@ -544,7 +552,7 @@ describe("WorkboardController", () => {
     expect(status.counters.startNotificationErrors).toBe(0);
   });
 
-  it("resolves start notification targets by explicit, owner history, then fallback precedence", async () => {
+  it("resolves ownerRoutes by specificity and declaration order for start notifications", async () => {
     async function runCase(input: {
       config: Record<string, unknown>;
       started: Record<string, unknown>;
@@ -565,38 +573,142 @@ describe("WorkboardController", () => {
       return { methods, wakeRuns };
     }
 
-    const explicit = await runCase({
-      config: { startNotifySessionKey: "agent:main:explicit", wakeFallbackSessionKey: "agent:main:fallback" },
-      started: { cardId: "card-explicit", title: "Explicit", sessionKey: "agent:main:workboard-card-explicit", runId: "run-explicit" },
-      cards: [{ id: "card-explicit", sessionKey: "agent:main:owner" }],
+    const exact = await runCase({
+      config: {
+        boardId: "board-a",
+        ownerRoutes: [
+          { boardId: "board-a", sessionKey: "agent:main:telegram:direct:board" },
+          { tenant: "tenant-may", boardId: "board-a", sessionKey: "agent:may:feishu:direct:tenant" },
+          { tenant: "tenant-may", boardId: "board-a", agentId: "may", sessionKey: "agent:may:feishu:direct:exact" },
+        ],
+        startNotifySessionKey: "agent:main:legacy",
+        wakeFallbackSessionKey: "agent:main:fallback",
+      },
+      started: { cardId: "card-exact", title: "Exact", sessionKey: "agent:may:workboard-card-exact", runId: "run-exact" },
+      cards: [{ id: "card-exact", agentId: "may", title: "Exact", metadata: { tenant: "tenant-may" } }],
     });
-    expect(explicit.wakeRuns).toHaveLength(1);
-    expect(explicit.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:explicit" });
-    expect(explicit.methods).not.toContain("workboard.cards.list");
+    expect(exact.wakeRuns).toHaveLength(1);
+    expect(exact.wakeRuns[0]).toMatchObject({ sessionKey: "agent:may:feishu:direct:exact", agentId: "may" });
+    expect(exact.methods).toContain("workboard.cards.list");
 
-    const owner = await runCase({
-      config: { wakeFallbackSessionKey: "agent:main:fallback" },
-      started: { cardId: "card-owner", title: "Owner", sessionKey: "agent:main:workboard-card-owner", runId: "run-owner" },
-      cards: [
-        {
-          id: "card-owner",
-          title: "Owner",
-          sessionKey: "agent:main:workboard-card-owner",
-          events: [{ kind: "created", at: 1, sessionKey: "agent:main:owner" }],
-        },
-      ],
+    const tenantBoard = await runCase({
+      config: {
+        boardId: "board-a",
+        ownerRoutes: [
+          { boardId: "board-a", sessionKey: "agent:main:telegram:direct:board" },
+          { tenant: "tenant-may", boardId: "board-a", sessionKey: "agent:may:feishu:direct:tenant" },
+        ],
+      },
+      started: { cardId: "card-tenant", title: "Tenant", sessionKey: "agent:muriel:workboard-card-tenant", runId: "run-tenant" },
+      cards: [{ id: "card-tenant", agentId: "muriel", title: "Tenant", metadata: { tenant: "tenant-may" } }],
     });
-    expect(owner.wakeRuns).toHaveLength(1);
-    expect(owner.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:owner" });
-    expect(owner.methods).toContain("workboard.cards.list");
+    expect(tenantBoard.wakeRuns).toHaveLength(1);
+    expect(tenantBoard.wakeRuns[0]).toMatchObject({ sessionKey: "agent:may:feishu:direct:tenant", agentId: "may" });
 
-    const fallback = await runCase({
-      config: { wakeFallbackSessionKey: "agent:main:fallback" },
-      started: { cardId: "card-fallback", title: "Fallback", sessionKey: "agent:main:workboard-card-fallback", runId: "run-fallback" },
-      cards: [{ id: "card-fallback", title: "Fallback", sessionKey: "agent:main:workboard-card-fallback" }],
+    const board = await runCase({
+      config: {
+        boardId: "board-a",
+        ownerRoutes: [
+          { boardId: "board-a", sessionKey: "agent:main:telegram:direct:board" },
+          { tenant: "tenant-other", boardId: "board-a", sessionKey: "agent:other:feishu:direct:tenant" },
+        ],
+      },
+      started: { cardId: "card-board", title: "Board", sessionKey: "agent:muriel:workboard-card-board", runId: "run-board" },
+      cards: [{ id: "card-board", agentId: "muriel", title: "Board", metadata: { tenant: "tenant-may" } }],
     });
-    expect(fallback.wakeRuns).toHaveLength(1);
-    expect(fallback.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:fallback" });
+    expect(board.wakeRuns).toHaveLength(1);
+    expect(board.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:telegram:direct:board", agentId: "main" });
+
+    const legacy = await runCase({
+      config: {
+        boardId: "board-c",
+        ownerRoutes: [{ boardId: "board-a", agentId: "may", sessionKey: "agent:may:feishu:direct:exact" }],
+        startNotifySessionKey: "agent:main:legacy",
+        wakeFallbackSessionKey: "agent:main:fallback",
+      },
+      started: { cardId: "card-legacy", title: "Legacy", sessionKey: "agent:muriel:workboard-card-legacy", runId: "run-legacy" },
+      cards: [{ id: "card-legacy", agentId: "muriel", title: "Legacy" }],
+    });
+    expect(legacy.wakeRuns).toHaveLength(1);
+    expect(legacy.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:legacy" });
+
+    const tie = await runCase({
+      config: {
+        boardId: "board-tie",
+        ownerRoutes: [
+          { boardId: "board-tie", sessionKey: "agent:main:telegram:direct:first" },
+          { boardId: "board-tie", sessionKey: "agent:main:telegram:direct:second" },
+        ],
+      },
+      started: { cardId: "card-tie", title: "Tie", sessionKey: "agent:main:workboard-card-tie", runId: "run-tie" },
+      cards: [{ id: "card-tie", agentId: "main", title: "Tie" }],
+    });
+    expect(tie.wakeRuns).toHaveLength(1);
+    expect(tie.wakeRuns[0]).toMatchObject({ sessionKey: "agent:main:telegram:direct:first" });
+  });
+
+  it("preserves opaque Feishu and QQ owner route session keys unchanged", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-opaque",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [
+          { boardId: "board-opaque", agentId: "may", sessionKey: "agent:may:feishu:direct:ou_abc123" },
+          { boardId: "board-opaque", agentId: "muriel", sessionKey: "agent:muriel:qq:direct:qq_456" },
+        ],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        started: [
+          { cardId: "card-may", title: "May", sessionKey: "agent:may:workboard-card-may", runId: "run-may" },
+          { cardId: "card-muriel", title: "Muriel", sessionKey: "agent:muriel:workboard-card-muriel", runId: "run-muriel" },
+        ],
+        cards: [
+          { id: "card-may", agentId: "may", title: "May" },
+          { id: "card-muriel", agentId: "muriel", title: "Muriel" },
+        ],
+      }),
+    });
+
+    await controller.runOnce("opaque-routes");
+
+    expect(wakeRuns.map((run) => run.sessionKey)).toEqual(["agent:may:feishu:direct:ou_abc123", "agent:muriel:qq:direct:qq_456"]);
+  });
+
+  it("uses ownerRoutes for problem wake via public list context and ignores worker session keys", async () => {
+    const store = new MemoryStateStore();
+    const methods: string[] = [];
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-problem",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [{ tenant: "tenant-may", boardId: "board-problem", agentId: "may", sessionKey: "agent:may:feishu:direct:problem-owner" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        methods,
+        eventBatches: [[{ id: "evt-problem", kind: "failed", createdAt: 1, message: "failed", sessionKey: "agent:may:workboard-card-problem", runId: "run-problem" }]],
+        cards: [{ id: "card-problem", agentId: "may", title: "Problem", sessionKey: "agent:may:workboard-card-problem", execution: { runId: "run-problem", sessionKey: "agent:may:workboard-card-problem" }, metadata: { tenant: "tenant-may" } }],
+      }),
+    });
+
+    const status = await controller.runOnce("problem-route");
+
+    expect(methods).toContain("workboard.cards.list");
+    expect(wakeRuns).toHaveLength(1);
+    expect(wakeRuns[0]).toMatchObject({ sessionKey: "agent:may:feishu:direct:problem-owner", agentId: "may" });
+    expect(wakeRuns[0]).not.toMatchObject({ sessionKey: "agent:may:workboard-card-problem" });
+    expect(status.counters.wakes).toBe(1);
+    expect(status.counters.wakeErrors).toBe(0);
   });
 
   it("records visible failure when no reliable external start notification target exists", async () => {
@@ -652,7 +764,7 @@ describe("WorkboardController", () => {
     const store = new MemoryStateStore();
     const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
     const controller = new WorkboardController({
-      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:workboard-card-worker", wakeFallbackSessionKey: "agent:main:owner" }),
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0, startNotifySessionKey: "agent:main:workboard-card-worker" }),
       runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
       fullConfig: {},
       stateStore: store,
@@ -666,7 +778,79 @@ describe("WorkboardController", () => {
 
     expect(wakeRuns).toHaveLength(0);
     expect(status.counters.startNotificationErrors).toBe(1);
-    expect(status.startNotificationFailures[0]?.error).toMatch(/could not resolve a reliable external owner session/);
+    expect(status.startNotificationFailures[0]?.error).toMatch(/startNotifySessionKey target rejected as a worker session/);
+  });
+
+  it("rejects ownerRoutes targets that are worker session keys", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({
+        boardId: "board-worker",
+        dispatchCooldownMs: 0,
+        ownerRoutes: [{ boardId: "board-worker", sessionKey: "agent:main:workboard-card-worker-route" }],
+      }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        started: [{ cardId: "card-worker-route", title: "Worker Route", sessionKey: "agent:main:workboard-card-worker-route", runId: "run-worker-route" }],
+        cards: [{ id: "card-worker-route", agentId: "main", title: "Worker Route" }],
+      }),
+    });
+
+    const status = await controller.runOnce("worker-route-target");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(status.counters.startNotificationErrors).toBe(1);
+    expect(status.startNotificationFailures[0]).toMatchObject({ target: "agent:main:workboard-card-worker-route" });
+    expect(status.startNotificationFailures[0]?.error).toMatch(/ownerRoutes target rejected as a worker session/);
+  });
+
+  it("records visible wake failure when no reliable problem route exists", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        eventBatches: [[{ id: "evt-no-route", kind: "failed", createdAt: 1, message: "failed", sessionKey: "agent:main:workboard-card-no-route", runId: "run-no-route" }]],
+        cards: [{ id: "card-no-route", agentId: "main", title: "No Route", execution: { runId: "run-no-route", sessionKey: "agent:main:workboard-card-no-route" } }],
+      }),
+    });
+
+    const status = await controller.runOnce("problem-no-route");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(status.counters.wakeErrors).toBe(1);
+    expect(status.lastError).toMatch(/problem wake failed/);
+    expect(status.wakeFailures).toMatchObject([{ problemKey: "failed:evt-no-route", kind: "failed", cardId: "card-no-route" }]);
+  });
+
+  it("records no-route wake failure for startFailure without card context", async () => {
+    const store = new MemoryStateStore();
+    const { runtimeAgent, wakeRuns } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ dispatchCooldownMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: startNotificationGateway({
+        startFailures: [{ error: "no worker" }],
+      }),
+    });
+
+    const status = await controller.runOnce("start-failure-no-context");
+
+    expect(wakeRuns).toHaveLength(0);
+    expect(status.counters.wakeErrors).toBe(1);
+    expect(status.wakeFailures[0]).toMatchObject({ kind: "failed", error: expect.stringMatching(/could not resolve a reliable owner route/) });
+    expect(status.wakeFailures[0]?.problemKey).toMatch(/^start-failure:/);
   });
 
 });

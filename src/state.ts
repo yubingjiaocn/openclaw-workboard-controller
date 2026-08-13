@@ -32,6 +32,15 @@ export type StartNotificationFailure = {
   at: number;
 };
 
+export type WakeFailure = {
+  problemKey: string;
+  kind: string;
+  cardId?: string;
+  target?: string;
+  error: string;
+  at: number;
+};
+
 export type ControllerState = {
   version: 1;
   subscriptionId?: string;
@@ -46,11 +55,13 @@ export type ControllerState = {
   archiveLastFailures: ArchiveFailure[];
   recentStartNotifications: StartNotificationRecord[];
   startNotificationFailures: StartNotificationFailure[];
+  wakeFailures: WakeFailure[];
   counters: {
     ticks: number;
     events: number;
     dispatches: number;
     wakes: number;
+    wakeErrors: number;
     errors: number;
     archiveScans: number;
     archiveCandidates: number;
@@ -77,7 +88,8 @@ export function emptyState(): ControllerState {
     archiveLastFailures: [],
     recentStartNotifications: [],
     startNotificationFailures: [],
-    counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
+    wakeFailures: [],
+    counters: { ticks: 0, events: 0, dispatches: 0, wakes: 0, wakeErrors: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0, startNotifications: 0, startNotificationErrors: 0 },
   };
 }
 
@@ -142,6 +154,22 @@ function normalizeStartNotificationFailures(value: unknown): StartNotificationFa
   }).slice(-50);
 }
 
+function normalizeWakeFailures(value: unknown): WakeFailure[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry): WakeFailure[] => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const problemKey = typeof record.problemKey === "string" ? record.problemKey : undefined;
+    const kind = typeof record.kind === "string" ? record.kind : undefined;
+    const cardId = typeof record.cardId === "string" ? record.cardId : undefined;
+    const target = typeof record.target === "string" ? record.target : undefined;
+    const error = typeof record.error === "string" ? record.error : undefined;
+    const at = typeof record.at === "number" && Number.isFinite(record.at) ? record.at : undefined;
+    if (!problemKey || !kind || !error || at === undefined) return [];
+    return [{ problemKey, kind, cardId, target, error, at }];
+  }).slice(-50);
+}
+
 function normalizeState(raw: unknown): ControllerState {
   const fallback = emptyState();
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return fallback;
@@ -163,11 +191,13 @@ function normalizeState(raw: unknown): ControllerState {
     archiveLastFailures: normalizeArchiveFailures(record.archiveLastFailures),
     recentStartNotifications: normalizeStartNotifications(record.recentStartNotifications),
     startNotificationFailures: normalizeStartNotificationFailures(record.startNotificationFailures),
+    wakeFailures: normalizeWakeFailures(record.wakeFailures),
     counters: {
       ticks: typeof counters.ticks === "number" ? counters.ticks : 0,
       events: typeof counters.events === "number" ? counters.events : 0,
       dispatches: typeof counters.dispatches === "number" ? counters.dispatches : 0,
       wakes: typeof counters.wakes === "number" ? counters.wakes : 0,
+      wakeErrors: typeof counters.wakeErrors === "number" ? counters.wakeErrors : 0,
       errors: typeof counters.errors === "number" ? counters.errors : 0,
       archiveScans: typeof counters.archiveScans === "number" ? counters.archiveScans : 0,
       archiveCandidates: typeof counters.archiveCandidates === "number" ? counters.archiveCandidates : 0,

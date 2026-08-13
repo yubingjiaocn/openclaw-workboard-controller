@@ -70,6 +70,35 @@
         "type": "string",
         "description": "Session key passed to /tools/invoke for Workboard notification tool policy routing. Default main."
       },
+      "ownerRoutes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sessionKey": {
+              "type": "string",
+              "description": "Full direct owner/routing session key. Preserve the channel-specific key exactly; do not use agent shortcuts."
+            },
+            "tenant": {
+              "type": "string",
+              "description": "Optional tenant match from public Workboard card metadata."
+            },
+            "boardId": {
+              "type": "string",
+              "description": "Optional Workboard board id match."
+            },
+            "agentId": {
+              "type": "string",
+              "description": "Optional Workboard card agent id match."
+            }
+          },
+          "required": [
+            "sessionKey"
+          ]
+        },
+        "description": "Channel-agnostic owner routing table. Each entry must include sessionKey and at least one of tenant, boardId, or agentId. More matching dimensions wins; equal specificity uses declaration order."
+      },
       "startNotifyEnabled": {
         "type": "boolean",
         "description": "Notify the owner/routing session when dispatch starts Workboard cards. Default true."
