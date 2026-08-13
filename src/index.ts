@@ -5,7 +5,9 @@ import { configSchema as rawConfigSchema, normalizeControllerConfig, PLUGIN_DESC
 import { WorkboardController } from "./controller.js";
 import { createGatewayMethodClient } from "./gateway-method-client.js";
 import { createWorkboardDispatchRouteHandler } from "./workboard-dispatch-route.js";
+import { createWorkboardArchiveRouteHandler, createWorkboardListRouteHandler } from "./workboard-gateway-routes.js";
 import { WORKBOARD_DISPATCH_ROUTE_PATH } from "./workboard-dispatch-shared.js";
+import { WORKBOARD_ARCHIVE_ROUTE_PATH, WORKBOARD_LIST_ROUTE_PATH } from "./workboard-gateway-shared.js";
 import { createFileStateStore } from "./state.js";
 
 let controller: WorkboardController | undefined;
@@ -22,7 +24,7 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
       {
         name: "workboard_controller_status",
         label: "Workboard Controller Status",
-        description: "Return Workboard controller status and durable cursor state summary.",
+        description: "Return Workboard controller status, archive dry-run candidates, counters, and durable cursor state summary.",
         parameters: Type.Object({}, { additionalProperties: false }),
         async execute() {
           return jsonResult(controller?.status() ?? { running: false, reason: "service not started" });
@@ -35,7 +37,7 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
       {
         name: "workboard_controller_tick",
         label: "Workboard Controller Tick",
-        description: "Run one Workboard controller notification/dispatch tick now.",
+        description: "Run one Workboard controller notification/dispatch tick now; archive scan runs only when its interval is due.",
         parameters: Type.Object({}, { additionalProperties: false }),
         async execute() {
           if (!controller) return jsonResult({ running: false, error: "service not started" });
@@ -50,6 +52,20 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
       auth: "gateway",
       match: "exact",
       handler: createWorkboardDispatchRouteHandler(),
+    });
+
+    api.registerHttpRoute({
+      path: WORKBOARD_LIST_ROUTE_PATH,
+      auth: "gateway",
+      match: "exact",
+      handler: createWorkboardListRouteHandler(),
+    });
+
+    api.registerHttpRoute({
+      path: WORKBOARD_ARCHIVE_ROUTE_PATH,
+      auth: "gateway",
+      match: "exact",
+      handler: createWorkboardArchiveRouteHandler(),
     });
 
     if (api.registrationMode !== "full") return;

@@ -10,6 +10,9 @@ const DEFAULT_LIMIT = 50;
 const DEFAULT_DISPATCH_COOLDOWN_MS = 2_000;
 const DEFAULT_WAKE_TIMEOUT_MS = 120_000;
 const DEFAULT_DISPATCH_TIMEOUT_MS = 60_000;
+const DEFAULT_ARCHIVE_COMPLETED_GRAPH_AFTER_MS = 86_400_000;
+const DEFAULT_ARCHIVE_STANDALONE_AFTER_MS = 604_800_000;
+const DEFAULT_ARCHIVE_SCAN_INTERVAL_MS = 3_600_000;
 
 export const configSchema = Type.Object(
   {
@@ -28,6 +31,12 @@ export const configSchema = Type.Object(
     wakeFallbackAgentId: Type.Optional(Type.String({ description: "Fallback agent id when an event/card has no agent. Default main." })),
     wakeTimeoutMs: Type.Optional(Type.Number({ description: "Problem wake embedded-agent timeout in milliseconds. Default 120000." })),
     wakeToolsAllow: Type.Optional(Type.Array(Type.String(), { description: "Optional tool allowlist for problem wake runs." })),
+    archiveEnabled: Type.Optional(Type.Boolean({ description: "Archive eligible done Workboard cards. Default false." })),
+    archiveDryRun: Type.Optional(Type.Boolean({ description: "Report archive candidates without mutating cards. Default true." })),
+    archiveCompletedGraphAfterMs: Type.Optional(Type.Number({ description: "Cooling period for all-done linked components before archive. Default 86400000." })),
+    archiveStandaloneAfterMs: Type.Optional(Type.Number({ description: "Cooling period for standalone done cards before archive. Default 604800000." })),
+    archiveRequireProof: Type.Optional(Type.Boolean({ description: "Require every card to have non-failed proof before archive. Default true." })),
+    archiveScanIntervalMs: Type.Optional(Type.Number({ description: "Minimum delay between archive scans. Default 3600000." })),
     compatibleOpenClawVersions: Type.Optional(Type.Array(Type.String(), { description: "Exact OpenClaw versions accepted by this compatibility seam." })),
     allowUntestedOpenClawVersion: Type.Optional(Type.Boolean({ description: "Disable exact OpenClaw version fail-fast. Default false." })),
   },
@@ -50,6 +59,12 @@ export type ControllerConfig = {
   wakeFallbackAgentId: string;
   wakeTimeoutMs: number;
   wakeToolsAllow?: string[];
+  archiveEnabled: boolean;
+  archiveDryRun: boolean;
+  archiveCompletedGraphAfterMs: number;
+  archiveStandaloneAfterMs: number;
+  archiveRequireProof: boolean;
+  archiveScanIntervalMs: number;
   compatibleOpenClawVersions: string[];
   allowUntestedOpenClawVersion: boolean;
 };
@@ -99,6 +114,12 @@ export function normalizeControllerConfig(raw: unknown): ControllerConfig {
     wakeFallbackAgentId: optionalString(record, "wakeFallbackAgentId") ?? "main",
     wakeTimeoutMs: optionalNumber(record, "wakeTimeoutMs", DEFAULT_WAKE_TIMEOUT_MS, 1_000, 900_000),
     wakeToolsAllow: optionalStringArray(record, "wakeToolsAllow"),
+    archiveEnabled: optionalBoolean(record, "archiveEnabled", false),
+    archiveDryRun: optionalBoolean(record, "archiveDryRun", true),
+    archiveCompletedGraphAfterMs: optionalNumber(record, "archiveCompletedGraphAfterMs", DEFAULT_ARCHIVE_COMPLETED_GRAPH_AFTER_MS, 0, 31_536_000_000),
+    archiveStandaloneAfterMs: optionalNumber(record, "archiveStandaloneAfterMs", DEFAULT_ARCHIVE_STANDALONE_AFTER_MS, 0, 31_536_000_000),
+    archiveRequireProof: optionalBoolean(record, "archiveRequireProof", true),
+    archiveScanIntervalMs: optionalNumber(record, "archiveScanIntervalMs", DEFAULT_ARCHIVE_SCAN_INTERVAL_MS, 60_000, 86_400_000),
     compatibleOpenClawVersions: optionalStringArray(record, "compatibleOpenClawVersions") ?? [SUPPORTED_OPENCLAW_VERSION],
     allowUntestedOpenClawVersion: optionalBoolean(record, "allowUntestedOpenClawVersion", false),
   };

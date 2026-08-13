@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { computeArchiveCandidates, type WorkboardArchiveCard } from "./archive.js";
 import type { ControllerConfig } from "./config.js";
 import { assertCompatibleOpenClawVersion } from "./config.js";
 import type { GatewayMethodClient } from "./gateway-method-client.js";
 import { errorMessage } from "./gateway-method-client.js";
-import type { ControllerState, StateStore } from "./state.js";
+import type { ArchiveFailure, ControllerState, StateStore } from "./state.js";
 import { rememberBounded } from "./state.js";
 
 type Logger = {
@@ -26,15 +27,11 @@ type WorkboardNotification = {
   runId?: string;
 };
 
-type WorkboardCard = {
-  id: string;
-  title?: string;
-  status?: string;
+type WorkboardCard = WorkboardArchiveCard & {
   agentId?: string;
   sessionKey?: string;
   runId?: string;
-  updatedAt?: number;
-  execution?: { sessionKey?: string; runId?: string; status?: string };
+  execution?: WorkboardArchiveCard["execution"] & { sessionKey?: string; runId?: string };
 };
 
 type NotificationEventsPayload = {
@@ -44,6 +41,14 @@ type NotificationEventsPayload = {
 
 type SubscribePayload = {
   subscription: { id: string };
+};
+
+type WorkboardListPayload = {
+  cards: WorkboardCard[];
+};
+
+type ArchivePayload = {
+  card: WorkboardCard;
 };
 
 type DispatchPayload = {
@@ -62,8 +67,20 @@ export type ControllerStatus = {
   subscriptionId?: string;
   lastTickAt?: number;
   lastDispatchAt?: number;
+  lastArchiveScanAt?: number;
   lastError?: string;
   counters: ControllerState["counters"];
+  archiveCandidates: ControllerState["archiveCandidates"];
+  archiveLastFailures: ControllerState["archiveLastFailures"];
+  archive: {
+    enabled: boolean;
+    dryRun: boolean;
+    requireProof: boolean;
+    scanIntervalMs: number;
+    completedGraphAfterMs: number;
+    standaloneAfterMs: number;
+    nextScanAt?: number;
+  };
   inFlight: boolean;
 };
 
@@ -121,8 +138,20 @@ export class WorkboardController {
       subscriptionId: state?.subscriptionId,
       lastTickAt: state?.lastTickAt,
       lastDispatchAt: state?.lastDispatchAt,
+      lastArchiveScanAt: state?.lastArchiveScanAt,
       lastError: state?.lastError,
-      counters: state?.counters ?? { ticks: 0, events: 0, dispatches: 0, wakes: 0, errors: 0 },
+      counters: state?.counters ?? { ticks: 0, events: 0, dispatches: 0, wakes: 0, errors: 0, archiveScans: 0, archiveCandidates: 0, archiveActions: 0, archiveErrors: 0 },
+      archiveCandidates: state?.archiveCandidates ?? [],
+      archiveLastFailures: state?.archiveLastFailures ?? [],
+      archive: {
+        enabled: this.options.config.archiveEnabled,
+        dryRun: this.options.config.archiveDryRun,
+        requireProof: this.options.config.archiveRequireProof,
+        scanIntervalMs: this.options.config.archiveScanIntervalMs,
+        completedGraphAfterMs: this.options.config.archiveCompletedGraphAfterMs,
+        standaloneAfterMs: this.options.config.archiveStandaloneAfterMs,
+        nextScanAt: state?.lastArchiveScanAt === undefined ? undefined : state.lastArchiveScanAt + this.options.config.archiveScanIntervalMs,
+      },
       inFlight: this.inFlight,
     };
   }
@@ -137,7 +166,8 @@ export class WorkboardController {
       await this.ensureSubscription();
       const batch = await this.processNotificationBatch();
       if (batch.newEvents > 0) await this.dispatchReadyCards(reason);
-      state.lastError = undefined;
+      const archiveOk = await this.runArchiveScanIfDue();
+      if (archiveOk || !state.lastError?.startsWith("archive ")) state.lastError = undefined;
       await this.save();
       return this.status();
     } catch (error) {
@@ -201,6 +231,76 @@ export class WorkboardController {
       await this.options.gateway.request("workboard.notifications.advance", { subscriptionId, limit: advanceCount });
     }
     return { advanceCount, newEvents };
+  }
+
+
+  private async runArchiveScanIfDue(): Promise<boolean> {
+    const state = await this.requireState();
+    if (!this.options.config.archiveEnabled) return true;
+    const now = Date.now();
+    if (state.lastArchiveScanAt && now - state.lastArchiveScanAt < this.options.config.archiveScanIntervalMs) return true;
+    state.lastArchiveScanAt = now;
+    state.counters.archiveScans += 1;
+    state.archiveCandidates = [];
+    state.archiveLastFailures = [];
+    await this.save();
+    let archiveOk = true;
+
+    try {
+      const payload = await this.options.gateway.request<WorkboardListPayload>("workboard.cards.list", { boardId: this.options.config.boardId });
+      const candidates = computeArchiveCandidates(payload.cards ?? [], {
+        now,
+        completedGraphAfterMs: this.options.config.archiveCompletedGraphAfterMs,
+        standaloneAfterMs: this.options.config.archiveStandaloneAfterMs,
+        requireProof: this.options.config.archiveRequireProof,
+        maxCandidates: 50,
+      });
+      state.archiveCandidates = candidates;
+      state.counters.archiveCandidates += candidates.reduce((total, candidate) => total + candidate.cardIds.length, 0);
+      await this.save();
+
+      if (this.options.config.archiveDryRun) {
+        if (state.lastError?.startsWith("archive ")) state.lastError = undefined;
+        await this.save();
+        return true;
+      }
+      for (const candidate of candidates) {
+        const currentPayload = await this.options.gateway.request<WorkboardListPayload>("workboard.cards.list", { boardId: this.options.config.boardId });
+        const stillEligible = computeArchiveCandidates(currentPayload.cards ?? [], {
+          now: Date.now(),
+          completedGraphAfterMs: this.options.config.archiveCompletedGraphAfterMs,
+          standaloneAfterMs: this.options.config.archiveStandaloneAfterMs,
+          requireProof: this.options.config.archiveRequireProof,
+          maxCandidates: 50,
+        }).find((entry) => entry.componentId === candidate.componentId);
+        if (!stillEligible) continue;
+        for (const cardId of stillEligible.cardIds) {
+          const title = stillEligible.titles[cardId];
+          try {
+            await this.options.gateway.request<ArchivePayload>("workboard.cards.archive", { id: cardId, archived: true });
+            state.counters.archiveActions += 1;
+            await this.save();
+          } catch (error) {
+            const failure: ArchiveFailure = { componentId: stillEligible.componentId, cardId, title, error: errorMessage(error), at: Date.now() };
+            archiveOk = false;
+            state.archiveLastFailures = [...state.archiveLastFailures, failure].slice(-50);
+            state.lastError = `archive failed for ${cardId}: ${failure.error}`;
+            state.counters.archiveErrors += 1;
+            await this.save();
+            this.options.logger?.warn?.("workboard-controller archive card failed", failure);
+          }
+        }
+      }
+    } catch (error) {
+      archiveOk = false;
+      state.lastError = `archive scan failed: ${errorMessage(error)}`;
+      state.counters.archiveErrors += 1;
+      await this.save();
+      this.options.logger?.warn?.("workboard-controller archive scan failed", { error: state.lastError });
+    }
+    if (archiveOk && state.lastError?.startsWith("archive ")) state.lastError = undefined;
+    await this.save();
+    return archiveOk;
   }
 
   private async handleNotification(event: WorkboardNotification): Promise<void> {

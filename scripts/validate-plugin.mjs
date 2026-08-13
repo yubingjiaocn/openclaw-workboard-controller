@@ -42,18 +42,27 @@ plugin.register({
   registerHttpRoute(route) { httpRoutes.push(route); },
   registerService(service) { services.push(service); },
 });
-const dispatchRoute = httpRoutes.find((route) => route.path === "/plugins/workboard-controller/workboard-dispatch");
-assert(dispatchRoute, "plugin must register the Workboard dispatch self-route");
-assert(dispatchRoute.auth === "gateway", "Workboard dispatch self-route must require Gateway auth");
-assert(dispatchRoute.match === "exact", "Workboard dispatch self-route must be exact-match only");
-assert(typeof dispatchRoute.handler === "function", "Workboard dispatch self-route must provide a handler");
+for (const routePath of [
+  "/plugins/workboard-controller/workboard-dispatch",
+  "/plugins/workboard-controller/workboard-list",
+  "/plugins/workboard-controller/workboard-archive",
+]) {
+  const route = httpRoutes.find((entry) => entry.path === routePath);
+  assert(route, `plugin must register ${routePath}`);
+  assert(route.auth === "gateway", `${routePath} must require Gateway auth`);
+  assert(route.match === "exact", `${routePath} must be exact-match only`);
+  assert(typeof route.handler === "function", `${routePath} must provide a handler`);
+}
 assert(services.length === 0, "tool-discovery registration must not register/start the service");
 
 const gatewayClientSource = await readFile(new URL("dist/gateway-method-client.js", root), "utf8");
 const dispatchSharedSource = await readFile(new URL("dist/workboard-dispatch-shared.js", root), "utf8");
+const gatewaySharedSource = await readFile(new URL("dist/workboard-gateway-shared.js", root), "utf8");
 assert(!gatewayClientSource.includes("workboard_dispatch"), "production dispatch path must not call the public workboard_dispatch tool");
 assert(gatewayClientSource.includes("WORKBOARD_DISPATCH_ROUTE_PATH"), "production dispatch path must import the self-route constant");
 assert(dispatchSharedSource.includes("/plugins/workboard-controller/workboard-dispatch"), "production dispatch path must call the authenticated self-route");
+assert(gatewaySharedSource.includes("/plugins/workboard-controller/workboard-list"), "production list path must call the authenticated self-route");
+assert(gatewaySharedSource.includes("/plugins/workboard-controller/workboard-archive"), "production archive path must call the authenticated self-route");
 
 const properties = manifest.configSchema?.properties ?? {};
 for (const key of [
@@ -65,6 +74,12 @@ for (const key of [
   "gatewayToolSessionKey",
   "wakeEnabled",
   "wakeFallbackAgentId",
+  "archiveEnabled",
+  "archiveDryRun",
+  "archiveCompletedGraphAfterMs",
+  "archiveStandaloneAfterMs",
+  "archiveRequireProof",
+  "archiveScanIntervalMs",
   "compatibleOpenClawVersions",
   "allowUntestedOpenClawVersion",
 ]) {

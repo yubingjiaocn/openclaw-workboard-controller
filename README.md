@@ -1,7 +1,7 @@
 # Workboard Controller
 
 Local-only OpenClaw plugin that closes the first Workboard automation gap:
-when Workboard emits terminal notifications, the controller dispatches the next ready cards; failed, stale, or newly blocked work wakes the owner session; normal successful chains stay quiet.
+when Workboard emits terminal notifications, the controller dispatches the next ready cards; failed, stale, or newly blocked work wakes the owner session; normal successful chains stay quiet. It can also scan for safely archived done cards, disabled and dry-run by default.
 
 ## Design
 
@@ -11,13 +11,18 @@ when Workboard emits terminal notifications, the controller dispatches the next 
 - Calls a Gateway-authenticated plugin self-route for `workboard.cards.dispatch`, so Workboard promotes ready cards and starts the same subagent worker runs used by the dashboard and CLI dispatch action.
 - Wakes owners for `failed`, `stale`, dispatch `blocked`, and worker start failures via `api.runtime.agent.runEmbeddedAgent`.
 - Does not clear Goals and does not create a workflow ledger.
+- Optionally scans Workboard cards through public Gateway RPC for done-card archive candidates. Archive automation defaults to `archiveEnabled=false` and `archiveDryRun=true`.
+- Treats a Workboard graph as the entire connected component reachable through parent/child links. A linked component is eligible only when every card in that component is visible in the public list result, every card is `done`, every card satisfies proof when `archiveRequireProof=true`, no card is todo/ready/running/blocked/failed/stale, and the component's latest terminal timestamp has passed `archiveCompletedGraphAfterMs`.
+- Uses `archiveStandaloneAfterMs` for unlinked done cards. Already archived cards are included in component safety checks but skipped for archive actions, so partial failures are retried idempotently.
+- Runs archive scans at most once per `archiveScanIntervalMs` from the periodic tick. The manual tick tool does not force a full archive rescan when the interval is not due.
 
 ## Gateway Invoke Path
 
-The controller uses two Gateway HTTP paths:
+The controller uses these Gateway HTTP paths:
 
 - Notification subscription, event reads, and cursor advance still call public Workboard notification tools through `/tools/invoke`: `workboard_notify_subscribe`, `workboard_notify_events`, and `workboard_notify_advance`.
 - Dispatch calls `POST /plugins/workboard-controller/workboard-dispatch`, a plugin-owned route registered with `auth: "gateway"` and `match: "exact"`. The route body is fixed to `{ "boardId": string }`, rejects unknown fields, and internally calls only `dispatchGatewayMethod("workboard.cards.dispatch", { boardId }, { expectFinal: true })`.
+- Archive scan reads cards through `POST /plugins/workboard-controller/workboard-list`, fixed to `workboard.cards.list`. Archive actions call `POST /plugins/workboard-controller/workboard-archive`, fixed to `workboard.cards.archive` with `{ "id": string, "archived": true }`. Both routes reject unknown fields and require Gateway auth.
 
 The manifest declares `contracts.gatewayMethodDispatch: ["authenticated-request"]`. OpenClaw grants the required `gatewayMethodDispatchAllowed` runtime scope only to authenticated plugin HTTP routes with that contract; the service timer never calls `dispatchGatewayMethod` directly.
 
@@ -57,7 +62,13 @@ Required config changes are left to the main agent/operator. At minimum, enable 
         config: {
           boardId: "default",
           pollIntervalMs: 15000,
-          gatewayToolSessionKey: "main"
+          gatewayToolSessionKey: "main",
+          archiveEnabled: false,
+          archiveDryRun: true,
+          archiveCompletedGraphAfterMs: 86400000,
+          archiveStandaloneAfterMs: 604800000,
+          archiveRequireProof: true,
+          archiveScanIntervalMs: 3600000
         }
       }
     }
@@ -69,14 +80,14 @@ Gateway restart is required after changing plugin config.
 
 ## Tools
 
-- `workboard_controller_status`: returns controller status, durable state path, counters, and last error.
-- `workboard_controller_tick`: runs one notification/dispatch pass manually.
+- `workboard_controller_status`: returns controller status, durable state path, counters, last error, archive config summary, bounded `archiveCandidates`, and bounded `archiveLastFailures`.
+- `workboard_controller_tick`: runs one notification/dispatch pass manually. It runs an archive scan only if `archiveEnabled=true` and `archiveScanIntervalMs` is due.
 
-Both tools are optional and exist for local verification/debugging. The controller's notification calls use `/tools/invoke`; make sure Workboard notification tools are allowed for `gatewayToolSessionKey` (default `main`). Dispatch uses the Gateway-authenticated self-route and does not call the public `workboard_dispatch` tool.
+Both tools are optional and exist for local verification/debugging. The controller's notification calls use `/tools/invoke`; make sure Workboard notification tools are allowed for `gatewayToolSessionKey` (default `main`). Dispatch, list, and archive use Gateway-authenticated self-routes fixed to public Workboard Gateway RPC methods. Dispatch does not call the public `workboard_dispatch` tool.
 
 ## Known Limits
 
-- First version does not auto-clear or archive Goals.
+- The controller does not auto-clear or archive Goals.
 - Problem wake uses an embedded agent run. If the target session has no usable delivery route, the event is still recorded in that session but may not produce an external chat notification.
 - The controller relies on Workboard notification events; if a card is manually moved to `blocked` without a Workboard `failed`/`stale` notification or dispatch result, it is not detected by this first version.
 - Version gate is intentionally strict because the Workboard notification tools, Gateway-authenticated route scope, and `workboard.cards.dispatch` envelope are version-sensitive.

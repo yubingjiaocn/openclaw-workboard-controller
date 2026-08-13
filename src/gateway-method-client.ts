@@ -1,5 +1,11 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { normalizeWorkboardDispatchRequestBody, WORKBOARD_DISPATCH_ROUTE_PATH } from "./workboard-dispatch-shared.js";
+import {
+  normalizeWorkboardArchiveRequestBody,
+  normalizeWorkboardListRequestBody,
+  WORKBOARD_ARCHIVE_ROUTE_PATH,
+  WORKBOARD_LIST_ROUTE_PATH,
+} from "./workboard-gateway-shared.js";
 
 export type GatewayMethodClient = {
   request<T = unknown>(method: string, params?: unknown, options?: { timeoutMs?: number }): Promise<T>;
@@ -104,6 +110,14 @@ function buildWorkboardDispatchRouteUrl(baseUrl: string): string {
   return `${baseUrl}${WORKBOARD_DISPATCH_ROUTE_PATH}`;
 }
 
+function buildWorkboardListRouteUrl(baseUrl: string): string {
+  return `${baseUrl}${WORKBOARD_LIST_ROUTE_PATH}`;
+}
+
+function buildWorkboardArchiveRouteUrl(baseUrl: string): string {
+  return `${baseUrl}${WORKBOARD_ARCHIVE_ROUTE_PATH}`;
+}
+
 function toolForMethod(method: string): string {
   const tool = METHOD_TO_TOOL[method];
   if (!tool) throw new Error(`unsupported gateway method for Workboard tool invoke client: ${method}`);
@@ -146,7 +160,7 @@ async function readJsonResponse(response: Response): Promise<ToolInvokeEnvelope>
   }
 }
 
-async function readGatewayDispatchResponse(response: Response): Promise<GatewayDispatchEnvelope> {
+async function readGatewayRouteResponse(response: Response): Promise<GatewayDispatchEnvelope> {
   const text = await response.text();
   if (!text.trim()) return {};
   try {
@@ -168,6 +182,8 @@ export function createGatewayMethodClient(options: GatewayMethodClientOptions): 
   const baseUrl = resolveGatewayBaseUrl(options.config, env, options.baseUrl);
   const toolInvokeUrl = buildToolInvokeUrl(baseUrl);
   const workboardDispatchRouteUrl = buildWorkboardDispatchRouteUrl(baseUrl);
+  const workboardListRouteUrl = buildWorkboardListRouteUrl(baseUrl);
+  const workboardArchiveRouteUrl = buildWorkboardArchiveRouteUrl(baseUrl);
   const auth = resolveGatewayHttpAuth(options.config, env);
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (!fetchImpl) throw new Error("global fetch is unavailable for gateway HTTP client");
@@ -181,14 +197,20 @@ export function createGatewayMethodClient(options: GatewayMethodClientOptions): 
       try {
         const headers: Record<string, string> = { "content-type": "application/json" };
         if (auth.kind === "bearer") headers.authorization = `Bearer ${auth.value}`;
-        if (method === "workboard.cards.dispatch") {
-          const response = await fetchImpl(workboardDispatchRouteUrl, {
+        if (method === "workboard.cards.dispatch" || method === "workboard.cards.list" || method === "workboard.cards.archive") {
+          const route = method === "workboard.cards.dispatch" ? workboardDispatchRouteUrl : method === "workboard.cards.list" ? workboardListRouteUrl : workboardArchiveRouteUrl;
+          const body = method === "workboard.cards.dispatch"
+            ? normalizeWorkboardDispatchRequestBody(params ?? {})
+            : method === "workboard.cards.list"
+              ? normalizeWorkboardListRequestBody(params ?? {})
+              : normalizeWorkboardArchiveRequestBody(params ?? {});
+          const response = await fetchImpl(route, {
             method: "POST",
             headers,
-            body: JSON.stringify(normalizeWorkboardDispatchRequestBody(params ?? {})),
+            body: JSON.stringify(body),
             signal: controller?.signal,
           });
-          const envelope = await readGatewayDispatchResponse(response);
+          const envelope = await readGatewayRouteResponse(response);
           if (!response.ok) {
             throw new Error(`${method} HTTP ${response.status}: ${envelope.error?.message ?? response.statusText}`);
           }

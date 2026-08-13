@@ -3,11 +3,19 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { dispatchGatewayMethod } from "openclaw/plugin-sdk/gateway-method-runtime";
 import plugin from "./index.js";
 import { describe, expect, it } from "vitest";
+import { computeArchiveCandidates, type WorkboardArchiveCard } from "./archive.js";
 import { assertCompatibleOpenClawVersion, normalizeControllerConfig, SUPPORTED_OPENCLAW_VERSION } from "./config.js";
 import { WorkboardController } from "./controller.js";
 import { createGatewayMethodClient } from "./gateway-method-client.js";
 import { createWorkboardDispatchRouteHandler } from "./workboard-dispatch-route.js";
+import { createWorkboardArchiveRouteHandler, createWorkboardListRouteHandler } from "./workboard-gateway-routes.js";
 import { normalizeWorkboardDispatchRequestBody, WORKBOARD_DISPATCH_ROUTE_PATH } from "./workboard-dispatch-shared.js";
+import {
+  normalizeWorkboardArchiveRequestBody,
+  normalizeWorkboardListRequestBody,
+  WORKBOARD_ARCHIVE_ROUTE_PATH,
+  WORKBOARD_LIST_ROUTE_PATH,
+} from "./workboard-gateway-shared.js";
 import type { ControllerState, StateStore } from "./state.js";
 import { emptyState } from "./state.js";
 
@@ -89,6 +97,51 @@ async function withToolInvokeServer<T>(handler: (req: IncomingMessage, res: Serv
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }
+}
+
+
+function doneCard(id: string, overrides: Partial<WorkboardArchiveCard> = {}): WorkboardArchiveCard {
+  return {
+    id,
+    title: `Card ${id}`,
+    status: "done",
+    priority: "normal",
+    labels: [],
+    position: 0,
+    createdAt: 1,
+    updatedAt: 1,
+    completedAt: 1,
+    metadata: { proof: [{ status: "passed" }], ...(overrides.metadata ?? {}) },
+    ...overrides,
+  } as WorkboardArchiveCard;
+}
+
+function linkTo(type: "parent" | "child", targetCardId: string) {
+  return { id: `${type}-${targetCardId}`, type, targetCardId, createdAt: 1 };
+}
+
+function archiveGateway(cards: WorkboardArchiveCard[], extra?: { failArchiveIds?: Set<string>; archives?: string[]; listCalls?: { count: number } }) {
+  return {
+    async request(method: string, params?: unknown) {
+      if (method === "workboard.notifications.subscribe") return { subscription: { id: "sub-archive" } };
+      if (method === "workboard.notifications.events") return { events: [] };
+      if (method === "workboard.cards.list") {
+        if (extra?.listCalls) extra.listCalls.count += 1;
+        return { cards: structuredClone(cards) };
+      }
+      if (method === "workboard.cards.archive") {
+        const id = (params as { id?: string }).id;
+        if (!id) throw new Error("missing id");
+        if (extra?.failArchiveIds?.has(id)) throw new Error(`archive denied for ${id}`);
+        extra?.archives?.push(id);
+        const card = cards.find((entry) => entry.id === id);
+        if (!card) throw new Error(`card not found: ${id}`);
+        card.metadata = { ...(card.metadata ?? {}), archivedAt: Date.now() };
+        return { card };
+      }
+      return {};
+    },
+  };
 }
 
 describe("config", () => {
@@ -196,6 +249,57 @@ describe("Workboard dispatch self-route", () => {
   });
 });
 
+
+  it("exposes fixed Gateway RPC self-routes for Workboard list and archive", async () => {
+    expect(normalizeWorkboardListRequestBody({ boardId: " default " })).toEqual({ boardId: "default" });
+    expect(() => normalizeWorkboardListRequestBody({ boardId: "default", method: "workboard.cards.list" })).toThrow(/unsupported request field: method/);
+    expect(normalizeWorkboardArchiveRequestBody({ id: " card-1 ", archived: true })).toEqual({ id: "card-1", archived: true });
+    expect(() => normalizeWorkboardArchiveRequestBody({ id: "card-1", params: {} })).toThrow(/unsupported request field: params/);
+
+    const calls: Array<{ method: string; params?: unknown; options?: unknown }> = [];
+    const listHandler = createWorkboardListRouteHandler(async (method, params, options) => {
+      calls.push({ method, params, options });
+      return { ok: true, payload: { cards: [{ id: "card-1", title: "done", status: "done" }] } };
+    });
+    const archiveHandler = createWorkboardArchiveRouteHandler(async (method, params, options) => {
+      calls.push({ method, params, options });
+      return { ok: true, payload: { card: { id: "card-1", title: "done", status: "done", metadata: { archivedAt: 10 } } } };
+    });
+
+    await withHttpServer(
+      async (req, res) => {
+        if (req.url === WORKBOARD_LIST_ROUTE_PATH) await listHandler(req, res);
+        else if (req.url === WORKBOARD_ARCHIVE_ROUTE_PATH) await archiveHandler(req, res);
+        else {
+          res.writeHead(404);
+          res.end();
+        }
+      },
+      async (baseUrl) => {
+        const listResponse = await fetch(baseUrl + WORKBOARD_LIST_ROUTE_PATH, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ boardId: "default" }),
+        });
+        expect(listResponse.status).toBe(200);
+        await expect(listResponse.json()).resolves.toMatchObject({ ok: true, payload: { cards: [{ id: "card-1" }] } });
+
+        const archiveResponse = await fetch(baseUrl + WORKBOARD_ARCHIVE_ROUTE_PATH, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: "card-1", archived: true }),
+        });
+        expect(archiveResponse.status).toBe(200);
+        await expect(archiveResponse.json()).resolves.toMatchObject({ ok: true, payload: { card: { id: "card-1" } } });
+      },
+    );
+
+    expect(calls).toEqual([
+      { method: "workboard.cards.list", params: { boardId: "default" }, options: { expectFinal: true } },
+      { method: "workboard.cards.archive", params: { id: "card-1", archived: true }, options: { expectFinal: true } },
+    ]);
+  });
+
 describe("WorkboardController", () => {
   it("dispatches after completed notification and advances after durable processing", async () => {
     const calls: Array<{ method: string; params?: unknown }> = [];
@@ -266,6 +370,164 @@ describe("WorkboardController", () => {
     expect(calls.filter((method) => method === "workboard.notifications.advance")).toHaveLength(2);
     expect(store.state.notifiedProblemIds).toEqual(["failed:evt-failed"]);
     expect(store.state.processedEventIds).toEqual(["evt-failed"]);
+  });
+});
+
+
+describe("archive candidate planning", () => {
+  it("treats parent/child links as a full connected component", () => {
+    const cards = [
+      doneCard("a", { metadata: { proof: [{ status: "passed" }], links: [linkTo("child", "b")] } }),
+      doneCard("b", { metadata: { proof: [{ status: "passed" }], links: [linkTo("parent", "a"), linkTo("child", "c")] } }),
+      doneCard("c", { metadata: { proof: [{ status: "passed" }], links: [linkTo("parent", "b")] } }),
+    ];
+
+    expect(computeArchiveCandidates(cards, { now: 10, completedGraphAfterMs: 0, standaloneAfterMs: 1000, requireProof: true })).toEqual([
+      {
+        componentId: "component:a",
+        cardIds: ["a", "b", "c"],
+        titles: { a: "Card a", b: "Card b", c: "Card c" },
+        reason: "component_all_done_cooldown_elapsed",
+        eligibleAt: 1,
+      },
+    ]);
+  });
+
+  it("uses the standalone threshold for unlinked done cards", () => {
+    const card = doneCard("solo", { completedAt: 100, updatedAt: 100 });
+    expect(computeArchiveCandidates([card], { now: 500, completedGraphAfterMs: 0, standaloneAfterMs: 1000, requireProof: true })).toEqual([]);
+    expect(computeArchiveCandidates([card], { now: 1100, completedGraphAfterMs: 0, standaloneAfterMs: 1000, requireProof: true })).toMatchObject([
+      { componentId: "standalone:solo", cardIds: ["solo"], reason: "standalone_done_cooldown_elapsed", eligibleAt: 1100 },
+    ]);
+  });
+
+  it("requires proof and resets eligibility when a card is reopened", () => {
+    const parent = doneCard("parent", { metadata: { proof: [{ status: "passed" }], links: [linkTo("child", "child")] } });
+    const childMissingProof = doneCard("child", { metadata: { links: [linkTo("parent", "parent")] } });
+    expect(computeArchiveCandidates([parent, childMissingProof], { now: 10_000, completedGraphAfterMs: 0, standaloneAfterMs: 0, requireProof: true })).toEqual([]);
+
+    const childReopened = doneCard("child", {
+      status: "todo",
+      completedAt: undefined,
+      updatedAt: 9_000,
+      metadata: { proof: [{ status: "passed" }], links: [linkTo("parent", "parent")] },
+    });
+    expect(computeArchiveCandidates([parent, childReopened], { now: 10_000, completedGraphAfterMs: 0, standaloneAfterMs: 0, requireProof: true })).toEqual([]);
+
+    const childRecentlyDone = doneCard("child", {
+      completedAt: 9_900,
+      updatedAt: 9_900,
+      metadata: { proof: [{ status: "passed" }], links: [linkTo("parent", "parent")] },
+    });
+    expect(computeArchiveCandidates([parent, childRecentlyDone], { now: 10_000, completedGraphAfterMs: 200, standaloneAfterMs: 0, requireProof: true })).toEqual([]);
+  });
+
+  it("does not archive cards with parent/child links to missing cards", () => {
+    const card = doneCard("child", { metadata: { proof: [{ status: "passed" }], links: [linkTo("parent", "missing-parent")] } });
+    expect(computeArchiveCandidates([card], { now: 10, completedGraphAfterMs: 0, standaloneAfterMs: 0, requireProof: true })).toEqual([]);
+  });
+
+  it("skips blocked, failed, stale, and already archived cards", () => {
+    const blocked = doneCard("blocked", { status: "blocked" });
+    const failed = doneCard("failed", { status: "failed" });
+    const stale = doneCard("stale", { metadata: { proof: [{ status: "passed" }], stale: { detectedAt: 1, reason: "old" } } });
+    const archived = doneCard("archived", { metadata: { proof: [{ status: "passed" }], archivedAt: 5 } });
+    expect(computeArchiveCandidates([blocked, failed, stale, archived], { now: 10, completedGraphAfterMs: 0, standaloneAfterMs: 0, requireProof: true })).toEqual([]);
+  });
+});
+
+describe("WorkboardController archive scan", () => {
+  it("returns dry-run graph candidates without archive actions", async () => {
+    const cards = [
+      doneCard("a", { metadata: { proof: [{ status: "passed" }], links: [linkTo("child", "b")] } }),
+      doneCard("b", { metadata: { proof: [{ status: "passed" }], links: [linkTo("parent", "a"), linkTo("child", "c")] } }),
+      doneCard("c", { metadata: { proof: [{ status: "passed" }], links: [linkTo("parent", "b")] } }),
+    ];
+    const store = new MemoryStateStore();
+    const { runtimeAgent } = makeRuntimeAgent();
+    const archives: string[] = [];
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ archiveEnabled: true, archiveDryRun: true, archiveCompletedGraphAfterMs: 0, archiveStandaloneAfterMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: archiveGateway(cards, { archives }),
+    });
+
+    const status = await controller.runOnce("archive-dry-run");
+
+    expect(status.archiveCandidates).toHaveLength(1);
+    expect(status.archiveCandidates[0]).toMatchObject({ componentId: "component:a", cardIds: ["a", "b", "c"] });
+    expect(status.counters.archiveScans).toBe(1);
+    expect(status.counters.archiveCandidates).toBe(3);
+    expect(status.counters.archiveActions).toBe(0);
+    expect(archives).toEqual([]);
+  });
+
+  it("records partial archive failure and later fills remaining unarchived cards", async () => {
+    const cards = [
+      doneCard("a", { metadata: { proof: [{ status: "passed" }], links: [linkTo("child", "b")] } }),
+      doneCard("b", { metadata: { proof: [{ status: "passed" }], links: [linkTo("parent", "a")] } }),
+    ];
+    const store = new MemoryStateStore();
+    const { runtimeAgent } = makeRuntimeAgent();
+    const failArchiveIds = new Set(["b"]);
+    const archives: string[] = [];
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ archiveEnabled: true, archiveDryRun: false, archiveCompletedGraphAfterMs: 0, archiveStandaloneAfterMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: archiveGateway(cards, { failArchiveIds, archives }),
+    });
+
+    let status = await controller.runOnce("archive-action");
+
+    expect(archives).toEqual(["a"]);
+    expect(status.archiveLastFailures).toMatchObject([{ componentId: "component:a", cardId: "b", error: "archive denied for b" }]);
+    expect(status.lastError).toMatch(/archive failed for b/);
+    expect(status.counters.archiveActions).toBe(1);
+    expect(status.counters.archiveErrors).toBe(1);
+
+    failArchiveIds.clear();
+    delete store.state.lastArchiveScanAt;
+    const retryController = new WorkboardController({
+      config: normalizeControllerConfig({ archiveEnabled: true, archiveDryRun: false, archiveCompletedGraphAfterMs: 0, archiveStandaloneAfterMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: archiveGateway(cards, { failArchiveIds, archives }),
+    });
+    status = await retryController.runOnce("archive-retry");
+
+    expect(archives).toEqual(["a", "b"]);
+    expect(status.archiveLastFailures).toEqual([]);
+    expect(status.lastError).toBeUndefined();
+    expect(status.counters.archiveActions).toBe(2);
+  });
+
+  it("does not rescan archive candidates before archiveScanIntervalMs elapses", async () => {
+    const cards = [doneCard("solo")];
+    const listCalls = { count: 0 };
+    const store = new MemoryStateStore();
+    const { runtimeAgent } = makeRuntimeAgent();
+    const controller = new WorkboardController({
+      config: normalizeControllerConfig({ archiveEnabled: true, archiveDryRun: true, archiveStandaloneAfterMs: 0 }),
+      runtimeVersion: SUPPORTED_OPENCLAW_VERSION,
+      fullConfig: {},
+      stateStore: store,
+      runtimeAgent,
+      gateway: archiveGateway(cards, { listCalls }),
+    });
+
+    await controller.runOnce("first");
+    await controller.runOnce("second");
+
+    expect(listCalls.count).toBe(1);
+    expect(store.state.counters.archiveScans).toBe(1);
   });
 });
 
@@ -357,6 +619,49 @@ describe("GatewayMethodClient", () => {
     expect(captured[0].body).not.toHaveProperty("method");
     expect(captured[0].body).not.toHaveProperty("params");
     expect(captured[0].body).not.toHaveProperty("tool");
+  });
+
+
+  it("invokes Workboard list and archive through fixed authenticated self-routes", async () => {
+    const captured: CapturedRequest[] = [];
+
+    await withHttpServer(
+      async (req, res) => {
+        const body = await readRequestBody(req);
+        captured.push({ method: req.method, url: req.url, headers: req.headers, body });
+        if (req.url === WORKBOARD_LIST_ROUTE_PATH) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, payload: { cards: [{ id: "card-1", status: "done" }] } }));
+          return;
+        }
+        if (req.url === WORKBOARD_ARCHIVE_ROUTE_PATH) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, payload: { card: { id: "card-1", status: "done", metadata: { archivedAt: 10 } } } }));
+          return;
+        }
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: { message: "not found" } }));
+      },
+      async (baseUrl) => {
+        const client = createGatewayMethodClient({
+          config: { gateway: { auth: { mode: "token", token: "config-token" } } },
+          env: { OPENCLAW_GATEWAY_TOKEN: "env-token" },
+          baseUrl,
+        });
+
+        await expect(client.request("workboard.cards.list", { boardId: "default" })).resolves.toEqual({ cards: [{ id: "card-1", status: "done" }] });
+        await expect(client.request("workboard.cards.archive", { id: "card-1", archived: true })).resolves.toEqual({
+          card: { id: "card-1", status: "done", metadata: { archivedAt: 10 } },
+        });
+      },
+    );
+
+    expect(captured.map((request) => request.url)).toEqual([WORKBOARD_LIST_ROUTE_PATH, WORKBOARD_ARCHIVE_ROUTE_PATH]);
+    expect(captured.map((request) => request.headers.authorization)).toEqual(["Bearer env-token", "Bearer env-token"]);
+    expect(captured.map((request) => request.body)).toEqual([{ boardId: "default" }, { id: "card-1", archived: true }]);
+    expect(captured.flatMap((request) => Object.keys(request.body))).not.toContain("method");
+    expect(captured.flatMap((request) => Object.keys(request.body))).not.toContain("params");
+    expect(captured.flatMap((request) => Object.keys(request.body))).not.toContain("tool");
   });
 
   it("parses JSON text content when tool result details are absent", async () => {

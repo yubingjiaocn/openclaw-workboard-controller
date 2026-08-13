@@ -2,7 +2,7 @@
   "id": "workboard-controller",
   "name": "Workboard Controller",
   "description": "Automatically dispatches Workboard ready cards after terminal events and wakes owners on problem events.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "activation": {
     "onStartup": true,
     "onConfigPaths": [
@@ -103,6 +103,30 @@
       "allowUntestedOpenClawVersion": {
         "type": "boolean",
         "description": "Disable exact OpenClaw version fail-fast. Default false."
+      },
+      "archiveEnabled": {
+        "type": "boolean",
+        "description": "Archive eligible done Workboard cards. Default false."
+      },
+      "archiveDryRun": {
+        "type": "boolean",
+        "description": "Report archive candidates without mutating cards. Default true."
+      },
+      "archiveCompletedGraphAfterMs": {
+        "type": "number",
+        "description": "Cooling period for all-done linked components before archive. Default 86400000."
+      },
+      "archiveStandaloneAfterMs": {
+        "type": "number",
+        "description": "Cooling period for standalone done cards before archive. Default 604800000."
+      },
+      "archiveRequireProof": {
+        "type": "boolean",
+        "description": "Require every card to have non-failed proof before archive. Default true."
+      },
+      "archiveScanIntervalMs": {
+        "type": "number",
+        "description": "Minimum delay between archive scans. Default 3600000."
       }
     }
   }
