@@ -13,9 +13,6 @@
     "tools": [
       "workboard_controller_status",
       "workboard_controller_tick"
-    ],
-    "gatewayMethodDispatch": [
-      "authenticated-request"
     ]
   },
   "toolMetadata": {
@@ -37,7 +34,9 @@
       "pollIntervalMs": { "type": "number", "description": "Notification poll interval in milliseconds. Default 15000." },
       "batchLimit": { "type": "number", "description": "Maximum Workboard notifications to process per tick. Default 50." },
       "dispatchCooldownMs": { "type": "number", "description": "Minimum delay between dispatch calls. Default 2000." },
-      "dispatchTimeoutMs": { "type": "number", "description": "Gateway dispatch timeout in milliseconds. Default 60000." },
+      "dispatchTimeoutMs": { "type": "number", "description": "Gateway /tools/invoke timeout for Workboard dispatch in milliseconds. Default 60000." },
+      "gatewayBaseUrl": { "type": "string", "description": "Optional Gateway HTTP base URL for /tools/invoke. Default http://127.0.0.1:${OPENCLAW_GATEWAY_PORT || gateway.port || 18789}." },
+      "gatewayToolSessionKey": { "type": "string", "description": "Session key passed to /tools/invoke for tool policy routing. Default main." },
       "wakeEnabled": { "type": "boolean", "description": "Wake owner sessions on failed/stale/blocked events. Default true." },
       "wakeFallbackSessionKey": { "type": "string", "description": "Fallback session key when an event/card has no linked session." },
       "wakeFallbackAgentId": { "type": "string", "description": "Fallback agent id when an event/card has no agent. Default main." },

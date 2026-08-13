@@ -54,7 +54,7 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
           runtimeVersion: api.runtime.version,
           fullConfig: ctx.config,
           stateStore: createFileStateStore(ctx.stateDir),
-          gateway: createGatewayMethodClient(),
+          gateway: createGatewayMethodClient({ config: ctx.config, baseUrl: config.gatewayBaseUrl, sessionKey: config.gatewayToolSessionKey }),
           runtimeAgent: api.runtime.agent,
           logger: ctx.logger,
         });

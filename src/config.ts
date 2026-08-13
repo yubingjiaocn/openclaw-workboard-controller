@@ -20,7 +20,9 @@ export const configSchema = Type.Object(
     pollIntervalMs: Type.Optional(Type.Number({ description: "Notification poll interval in milliseconds. Default 15000." })),
     batchLimit: Type.Optional(Type.Number({ description: "Maximum Workboard notifications to process per tick. Default 50." })),
     dispatchCooldownMs: Type.Optional(Type.Number({ description: "Minimum delay between dispatch calls. Default 2000." })),
-    dispatchTimeoutMs: Type.Optional(Type.Number({ description: "Gateway dispatch timeout in milliseconds. Default 60000." })),
+    dispatchTimeoutMs: Type.Optional(Type.Number({ description: "Gateway /tools/invoke timeout for Workboard dispatch in milliseconds. Default 60000." })),
+    gatewayBaseUrl: Type.Optional(Type.String({ description: "Optional Gateway HTTP base URL for /tools/invoke. Default http://127.0.0.1:${OPENCLAW_GATEWAY_PORT || gateway.port || 18789}." })),
+    gatewayToolSessionKey: Type.Optional(Type.String({ description: "Session key passed to /tools/invoke for tool policy routing. Default main." })),
     wakeEnabled: Type.Optional(Type.Boolean({ description: "Wake owner sessions on failed/stale/blocked events. Default true." })),
     wakeFallbackSessionKey: Type.Optional(Type.String({ description: "Fallback session key when an event/card has no linked session." })),
     wakeFallbackAgentId: Type.Optional(Type.String({ description: "Fallback agent id when an event/card has no agent. Default main." })),
@@ -41,6 +43,8 @@ export type ControllerConfig = {
   batchLimit: number;
   dispatchCooldownMs: number;
   dispatchTimeoutMs: number;
+  gatewayBaseUrl?: string;
+  gatewayToolSessionKey: string;
   wakeEnabled: boolean;
   wakeFallbackSessionKey?: string;
   wakeFallbackAgentId: string;
@@ -88,6 +92,8 @@ export function normalizeControllerConfig(raw: unknown): ControllerConfig {
     batchLimit: optionalNumber(record, "batchLimit", DEFAULT_LIMIT, 1, 200),
     dispatchCooldownMs: optionalNumber(record, "dispatchCooldownMs", DEFAULT_DISPATCH_COOLDOWN_MS, 0, 300_000),
     dispatchTimeoutMs: optionalNumber(record, "dispatchTimeoutMs", DEFAULT_DISPATCH_TIMEOUT_MS, 1_000, 600_000),
+    gatewayBaseUrl: optionalString(record, "gatewayBaseUrl"),
+    gatewayToolSessionKey: optionalString(record, "gatewayToolSessionKey") ?? "main",
     wakeEnabled: optionalBoolean(record, "wakeEnabled", true),
     wakeFallbackSessionKey: optionalString(record, "wakeFallbackSessionKey"),
     wakeFallbackAgentId: optionalString(record, "wakeFallbackAgentId") ?? "main",

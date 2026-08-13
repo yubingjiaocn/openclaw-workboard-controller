@@ -28,8 +28,7 @@ for (const tool of ["workboard_controller_status", "workboard_controller_tick"])
   assert(manifest.toolMetadata?.[tool]?.optional === true, `${tool} must be marked optional`);
 }
 
-const dispatch = manifest.contracts?.gatewayMethodDispatch ?? [];
-assert(dispatch.includes("authenticated-request"), "manifest must declare gatewayMethodDispatch authenticated-request seam");
+assert(!manifest.contracts?.gatewayMethodDispatch, "manifest must not declare gatewayMethodDispatch; service uses /tools/invoke HTTP instead");
 assert(manifest.activation?.onStartup === true, "manifest activation.onStartup must be true");
 assert(manifest.activation?.onConfigPaths?.includes("plugins.entries.workboard-controller"), "manifest must watch controller config path");
 
@@ -39,6 +38,8 @@ for (const key of [
   "boardId",
   "pollIntervalMs",
   "dispatchCooldownMs",
+  "gatewayBaseUrl",
+  "gatewayToolSessionKey",
   "wakeEnabled",
   "wakeFallbackAgentId",
   "compatibleOpenClawVersions",
@@ -52,5 +53,5 @@ console.log(JSON.stringify({
   pluginId: plugin.id,
   entry: "./dist/index.js",
   tools,
-  gatewayMethodDispatch: dispatch,
+  gatewayMethodDispatch: manifest.contracts?.gatewayMethodDispatch ?? [],
 }, null, 2));
