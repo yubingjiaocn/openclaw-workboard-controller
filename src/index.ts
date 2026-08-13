@@ -4,6 +4,8 @@ import { jsonResult } from "openclaw/plugin-sdk/tool-results";
 import { configSchema as rawConfigSchema, normalizeControllerConfig, PLUGIN_DESCRIPTION, PLUGIN_ID, PLUGIN_NAME } from "./config.js";
 import { WorkboardController } from "./controller.js";
 import { createGatewayMethodClient } from "./gateway-method-client.js";
+import { createWorkboardDispatchRouteHandler } from "./workboard-dispatch-route.js";
+import { WORKBOARD_DISPATCH_ROUTE_PATH } from "./workboard-dispatch-shared.js";
 import { createFileStateStore } from "./state.js";
 
 let controller: WorkboardController | undefined;
@@ -42,6 +44,13 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
       },
       { optional: true },
     );
+
+    api.registerHttpRoute({
+      path: WORKBOARD_DISPATCH_ROUTE_PATH,
+      auth: "gateway",
+      match: "exact",
+      handler: createWorkboardDispatchRouteHandler(),
+    });
 
     if (api.registrationMode !== "full") return;
 

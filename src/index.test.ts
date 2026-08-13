@@ -1,10 +1,13 @@
 import { once } from "node:events";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dispatchGatewayMethod } from "openclaw/plugin-sdk/gateway-method-runtime";
+import plugin from "./index.js";
 import { describe, expect, it } from "vitest";
 import { assertCompatibleOpenClawVersion, normalizeControllerConfig, SUPPORTED_OPENCLAW_VERSION } from "./config.js";
 import { WorkboardController } from "./controller.js";
 import { createGatewayMethodClient } from "./gateway-method-client.js";
+import { createWorkboardDispatchRouteHandler } from "./workboard-dispatch-route.js";
+import { normalizeWorkboardDispatchRequestBody, WORKBOARD_DISPATCH_ROUTE_PATH } from "./workboard-dispatch-shared.js";
 import type { ControllerState, StateStore } from "./state.js";
 import { emptyState } from "./state.js";
 
@@ -49,6 +52,25 @@ async function readRequestBody(req: IncomingMessage): Promise<Record<string, unk
   return text ? (JSON.parse(text) as Record<string, unknown>) : {};
 }
 
+async function withHttpServer<T>(handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>, run: (baseUrl: string) => Promise<T>): Promise<T> {
+  const server = createServer(async (req, res) => {
+    try {
+      await handler(req, res);
+    } catch (error) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: { type: "TEST_ERROR", message: error instanceof Error ? error.message : String(error) } }));
+    }
+  });
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind to a TCP port");
+    return await run(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+}
+
 async function withToolInvokeServer<T>(handler: (req: IncomingMessage, res: ServerResponse, body: Record<string, unknown>) => void | Promise<void>, run: (baseUrl: string) => Promise<T>): Promise<T> {
   const server = createServer(async (req, res) => {
     try {
@@ -75,6 +97,102 @@ describe("config", () => {
     expect(config.compatibleOpenClawVersions).toEqual([SUPPORTED_OPENCLAW_VERSION]);
     expect(() => assertCompatibleOpenClawVersion(config, SUPPORTED_OPENCLAW_VERSION)).not.toThrow();
     expect(() => assertCompatibleOpenClawVersion(config, "2026.8.1")).toThrow(/version-gated/);
+  });
+});
+
+describe("plugin entry", () => {
+  it("registers a Gateway-authenticated exact self-route for dispatch", () => {
+    const routes: Array<Record<string, unknown>> = [];
+    (plugin.register as (api: Record<string, unknown>) => void)({
+      registrationMode: "tool-discovery",
+      pluginConfig: {},
+      runtime: { version: SUPPORTED_OPENCLAW_VERSION, agent: {} },
+      registerTool() {},
+      registerHttpRoute(route: Record<string, unknown>) {
+        routes.push(route);
+      },
+      registerService() {
+        throw new Error("service should not register in tool-discovery mode");
+      },
+    });
+
+    const route = routes.find((entry) => entry.path === WORKBOARD_DISPATCH_ROUTE_PATH);
+    expect(route).toMatchObject({ path: WORKBOARD_DISPATCH_ROUTE_PATH, auth: "gateway", match: "exact" });
+    expect(route?.handler).toEqual(expect.any(Function));
+  });
+});
+
+describe("Workboard dispatch self-route", () => {
+  it("whitelists only boardId input", () => {
+    expect(normalizeWorkboardDispatchRequestBody({ boardId: " default " })).toEqual({ boardId: "default" });
+    expect(() => normalizeWorkboardDispatchRequestBody({ boardId: "default", method: "status" })).toThrow(/unsupported request field: method/);
+    expect(() => normalizeWorkboardDispatchRequestBody({ boardId: "" })).toThrow(/boardId must be a non-empty string/);
+  });
+
+  it("dispatches the fixed workboard.cards.dispatch method and returns started/startFailures payload", async () => {
+    const calls: Array<{ method: string; params?: unknown; options?: unknown }> = [];
+    const handler = createWorkboardDispatchRouteHandler(async (method, params, options) => {
+      calls.push({ method, params, options });
+      return {
+        ok: true,
+        payload: {
+          started: [{ cardId: "card-2", title: "next", sessionKey: "agent:main:workboard-card-2", runId: "run-2" }],
+          startFailures: [{ cardId: "card-3", error: "no worker" }],
+        },
+      };
+    });
+
+    await withHttpServer(
+      async (req, res) => {
+        await handler(req, res);
+      },
+      async (baseUrl) => {
+        const response = await fetch(baseUrl + WORKBOARD_DISPATCH_ROUTE_PATH, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ boardId: "default" }),
+        });
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({
+          ok: true,
+          payload: {
+            started: [{ cardId: "card-2", title: "next", sessionKey: "agent:main:workboard-card-2", runId: "run-2" }],
+            startFailures: [{ cardId: "card-3", error: "no worker" }],
+          },
+        });
+      },
+    );
+
+    expect(calls).toEqual([{ method: "workboard.cards.dispatch", params: { boardId: "default" }, options: { expectFinal: true } }]);
+  });
+
+  it("rejects non-POST and non-whitelisted body fields before dispatch", async () => {
+    let dispatchCalls = 0;
+    const handler = createWorkboardDispatchRouteHandler(async () => {
+      dispatchCalls += 1;
+      return { ok: true, payload: {} };
+    });
+
+    await withHttpServer(
+      async (req, res) => {
+        await handler(req, res);
+      },
+      async (baseUrl) => {
+        const getResponse = await fetch(baseUrl + WORKBOARD_DISPATCH_ROUTE_PATH);
+        expect(getResponse.status).toBe(405);
+        expect(getResponse.headers.get("allow")).toBe("POST");
+
+        const proxyResponse = await fetch(baseUrl + WORKBOARD_DISPATCH_ROUTE_PATH, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ method: "workboard.cards.dispatch", params: { boardId: "default" } }),
+        });
+        expect(proxyResponse.status).toBe(400);
+        await expect(proxyResponse.json()).resolves.toMatchObject({ ok: false, error: { type: "invalid_request" } });
+      },
+    );
+
+    expect(dispatchCalls).toBe(0);
   });
 });
 
@@ -155,7 +273,7 @@ describe("GatewayMethodClient", () => {
     await expect(dispatchGatewayMethod("workboard.cards.dispatch", {})).rejects.toThrow(/reserved for plugin HTTP routes/);
   });
 
-  it("invokes Workboard tools over /tools/invoke with gateway auth and parses result.details", async () => {
+  it("invokes Workboard notification tools over /tools/invoke with gateway auth and parses result.details", async () => {
     const captured: CapturedRequest[] = [];
 
     await withToolInvokeServer(
@@ -169,9 +287,7 @@ describe("GatewayMethodClient", () => {
               ? { subscription: { id: "sub-http" }, events: [{ id: "evt-http", kind: "completed", createdAt: 1, message: "done" }] }
               : tool === "workboard_notify_advance"
                 ? { subscription: { id: "sub-http", lastEventId: "evt-http" }, events: [{ id: "evt-http", kind: "completed", createdAt: 1, message: "done" }] }
-                : tool === "workboard_dispatch"
-                  ? { promoted: [], reclaimed: [], blocked: [], orchestrated: [], count: 0 }
-                  : { unexpectedTool: tool };
+                : { unexpectedTool: tool };
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, result: { content: [{ type: "text", text: JSON.stringify(details) }], details } }));
       },
@@ -191,24 +307,54 @@ describe("GatewayMethodClient", () => {
           subscription: { id: "sub-http", lastEventId: "evt-http" },
           events: [{ id: "evt-http", kind: "completed", createdAt: 1, message: "done" }],
         });
-        await expect(client.request("workboard.cards.dispatch", { boardId: "default" }, { timeoutMs: 1_000 })).resolves.toEqual({
-          promoted: [],
-          reclaimed: [],
-          blocked: [],
-          orchestrated: [],
-          count: 0,
-        });
       },
     );
 
-    expect(captured.map((request) => request.url)).toEqual(["/tools/invoke", "/tools/invoke", "/tools/invoke", "/tools/invoke"]);
-    expect(captured.map((request) => request.headers.authorization)).toEqual(["Bearer env-token", "Bearer env-token", "Bearer env-token", "Bearer env-token"]);
-    expect(captured.map((request) => request.body.tool)).toEqual(["workboard_notify_subscribe", "workboard_notify_events", "workboard_notify_advance", "workboard_dispatch"]);
+    expect(captured.map((request) => request.url)).toEqual(["/tools/invoke", "/tools/invoke", "/tools/invoke"]);
+    expect(captured.map((request) => request.headers.authorization)).toEqual(["Bearer env-token", "Bearer env-token", "Bearer env-token"]);
+    expect(captured.map((request) => request.body.tool)).toEqual(["workboard_notify_subscribe", "workboard_notify_events", "workboard_notify_advance"]);
+    expect(captured.map((request) => request.body.tool)).not.toContain("workboard_dispatch");
     expect(captured[0].body).toMatchObject({
       args: { boardId: "default", target: "controller" },
       sessionKey: "main",
     });
-    expect(captured[3].body).toMatchObject({ args: { boardId: "default" } });
+  });
+
+  it("invokes Workboard dispatch through the authenticated self-route", async () => {
+    const captured: CapturedRequest[] = [];
+
+    await withHttpServer(
+      async (req, res) => {
+        const body = await readRequestBody(req);
+        captured.push({ method: req.method, url: req.url, headers: req.headers, body });
+        expect(req.url).toBe(WORKBOARD_DISPATCH_ROUTE_PATH);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, payload: { started: [{ cardId: "card-2", title: "next", sessionKey: "agent:main:workboard-card-2", runId: "run-2" }], startFailures: [] } }));
+      },
+      async (baseUrl) => {
+        const client = createGatewayMethodClient({
+          config: { gateway: { auth: { mode: "token", token: "config-token" } } },
+          env: { OPENCLAW_GATEWAY_TOKEN: "env-token" },
+          baseUrl,
+        });
+
+        await expect(client.request("workboard.cards.dispatch", { boardId: "default" }, { timeoutMs: 1_000 })).resolves.toEqual({
+          started: [{ cardId: "card-2", title: "next", sessionKey: "agent:main:workboard-card-2", runId: "run-2" }],
+          startFailures: [],
+        });
+      },
+    );
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]).toMatchObject({
+      method: "POST",
+      url: WORKBOARD_DISPATCH_ROUTE_PATH,
+      body: { boardId: "default" },
+    });
+    expect(captured[0].headers.authorization).toBe("Bearer env-token");
+    expect(captured[0].body).not.toHaveProperty("method");
+    expect(captured[0].body).not.toHaveProperty("params");
+    expect(captured[0].body).not.toHaveProperty("tool");
   });
 
   it("parses JSON text content when tool result details are absent", async () => {

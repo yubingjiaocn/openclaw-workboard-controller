@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
+import { normalizeWorkboardDispatchRequestBody, WORKBOARD_DISPATCH_ROUTE_PATH } from "./workboard-dispatch-shared.js";
 
 export type GatewayMethodClient = {
   request<T = unknown>(method: string, params?: unknown, options?: { timeoutMs?: number }): Promise<T>;
@@ -24,12 +25,18 @@ type ToolInvokeEnvelope = {
   error?: { type?: string; message?: string };
 };
 
+type GatewayDispatchEnvelope = {
+  ok?: unknown;
+  payload?: unknown;
+  error?: { type?: string; code?: string; message?: string };
+  meta?: Record<string, unknown>;
+};
+
 const DEFAULT_GATEWAY_PORT = 18789;
 const METHOD_TO_TOOL: Record<string, string> = {
   "workboard.notifications.subscribe": "workboard_notify_subscribe",
   "workboard.notifications.events": "workboard_notify_events",
   "workboard.notifications.advance": "workboard_notify_advance",
-  "workboard.cards.dispatch": "workboard_dispatch",
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -78,12 +85,12 @@ function resolveGatewayHttpAuth(config: OpenClawConfig, env: NodeJS.ProcessEnv):
   if (mode === "trusted-proxy") {
     const password = runtimeEnvString(config, env, "OPENCLAW_GATEWAY_PASSWORD") ?? optionalString(auth.password);
     if (!password) {
-      throw new Error("gateway trusted-proxy auth is configured; direct loopback /tools/invoke requires gateway.auth.password or OPENCLAW_GATEWAY_PASSWORD fallback");
+      throw new Error("gateway trusted-proxy auth is configured; direct loopback Gateway HTTP requires gateway.auth.password or OPENCLAW_GATEWAY_PASSWORD fallback");
     }
     return { kind: "bearer", value: password };
   }
 
-  if (mode !== "token") throw new Error(`unsupported gateway auth mode for /tools/invoke: ${mode}`);
+  if (mode !== "token") throw new Error(`unsupported gateway auth mode for Gateway HTTP: ${mode}`);
   const token = runtimeEnvString(config, env, "OPENCLAW_GATEWAY_TOKEN") ?? optionalString(auth.token);
   if (!token) throw new Error("gateway token auth is configured, but no runtime gateway token is available");
   return { kind: "bearer", value: token };
@@ -91,6 +98,10 @@ function resolveGatewayHttpAuth(config: OpenClawConfig, env: NodeJS.ProcessEnv):
 
 function buildToolInvokeUrl(baseUrl: string): string {
   return `${baseUrl}/tools/invoke`;
+}
+
+function buildWorkboardDispatchRouteUrl(baseUrl: string): string {
+  return `${baseUrl}${WORKBOARD_DISPATCH_ROUTE_PATH}`;
 }
 
 function toolForMethod(method: string): string {
@@ -135,6 +146,16 @@ async function readJsonResponse(response: Response): Promise<ToolInvokeEnvelope>
   }
 }
 
+async function readGatewayDispatchResponse(response: Response): Promise<GatewayDispatchEnvelope> {
+  const text = await response.text();
+  if (!text.trim()) return {};
+  try {
+    return JSON.parse(text) as GatewayDispatchEnvelope;
+  } catch {
+    return { ok: false, error: { message: text } };
+  }
+}
+
 export function errorMessage(error: unknown): string {
   if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") {
     return (error as { message: string }).message;
@@ -145,21 +166,41 @@ export function errorMessage(error: unknown): string {
 export function createGatewayMethodClient(options: GatewayMethodClientOptions): GatewayMethodClient {
   const env = options.env ?? process.env;
   const baseUrl = resolveGatewayBaseUrl(options.config, env, options.baseUrl);
-  const url = buildToolInvokeUrl(baseUrl);
+  const toolInvokeUrl = buildToolInvokeUrl(baseUrl);
+  const workboardDispatchRouteUrl = buildWorkboardDispatchRouteUrl(baseUrl);
   const auth = resolveGatewayHttpAuth(options.config, env);
   const fetchImpl = options.fetch ?? globalThis.fetch;
-  if (!fetchImpl) throw new Error("global fetch is unavailable for gateway /tools/invoke client");
+  if (!fetchImpl) throw new Error("global fetch is unavailable for gateway HTTP client");
 
   return {
     async request<T = unknown>(method: string, params?: unknown, requestOptions?: { timeoutMs?: number }): Promise<T> {
       const controller = requestOptions?.timeoutMs ? new AbortController() : undefined;
       const timeout = controller
-        ? setTimeout(() => controller.abort(new Error(`gateway tool invoke timed out after ${requestOptions?.timeoutMs}ms: ${method}`)), requestOptions?.timeoutMs)
+        ? setTimeout(() => controller.abort(new Error(`gateway HTTP request timed out after ${requestOptions?.timeoutMs}ms: ${method}`)), requestOptions?.timeoutMs)
         : undefined;
       try {
         const headers: Record<string, string> = { "content-type": "application/json" };
         if (auth.kind === "bearer") headers.authorization = `Bearer ${auth.value}`;
-        const response = await fetchImpl(url, {
+        if (method === "workboard.cards.dispatch") {
+          const response = await fetchImpl(workboardDispatchRouteUrl, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(normalizeWorkboardDispatchRequestBody(params ?? {})),
+            signal: controller?.signal,
+          });
+          const envelope = await readGatewayDispatchResponse(response);
+          if (!response.ok) {
+            throw new Error(`${method} HTTP ${response.status}: ${envelope.error?.message ?? response.statusText}`);
+          }
+          if (envelope.ok !== true) {
+            const type = envelope.error?.code ?? envelope.error?.type;
+            const prefix = type ? `${type}: ` : "";
+            throw new Error(`${method} failed: ${prefix}${envelope.error?.message ?? "unknown error"}`);
+          }
+          return envelope.payload as T;
+        }
+
+        const response = await fetchImpl(toolInvokeUrl, {
           method: "POST",
           headers,
           body: JSON.stringify({
@@ -180,7 +221,7 @@ export function createGatewayMethodClient(options: GatewayMethodClientOptions): 
         return parseToolPayload<T>(method, envelope.result);
       } catch (error) {
         if (error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError") {
-          throw new Error(`gateway tool invoke timed out after ${requestOptions?.timeoutMs}ms: ${method}`);
+          throw new Error(`gateway HTTP request timed out after ${requestOptions?.timeoutMs}ms: ${method}`);
         }
         throw error;
       } finally {
